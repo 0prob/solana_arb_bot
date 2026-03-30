@@ -34,7 +34,7 @@ use solana_sdk::{
     transaction::VersionedTransaction,
 };
 use std::sync::Arc;
-use tokio::sync::mpsc;
+use tokio::sync::{mpsc, Mutex};
 use tokio_util::sync::CancellationToken;
 use tracing::{debug, error, info, warn};
 
@@ -70,6 +70,20 @@ struct ExecutionOutcome {
 /// Minimum ALT account header size in bytes.
 const ALT_HEADER_LEN: usize = 56;
 
+/// Cached slot value with a timestamp.  Refreshed at most once per Solana slot
+/// (~400 ms) to avoid a redundant `get_slot` RPC call for every opportunity.
+struct SlotCache {
+    slot:        u64,
+    fetched_at:  std::time::Instant,
+}
+
+impl SlotCache {
+    fn stale(&self) -> bool {
+        // One slot ≈ 400 ms; refresh every 300 ms to stay ahead of the boundary.
+        self.fetched_at.elapsed() > std::time::Duration::from_millis(300)
+    }
+}
+
 pub async fn run(
     config: Arc<AppConfig>,
     mut rx: mpsc::Receiver<ArbOpportunity>,
@@ -93,6 +107,10 @@ pub async fn run(
 
     let breaker = CircuitBreaker::new(5, 60);
 
+    // Shared slot cache — avoids a redundant `get_slot` RPC call for every
+    // opportunity that arrives within the same ~400 ms slot window.
+    let slot_cache: Arc<Mutex<Option<SlotCache>>> = Arc::new(Mutex::new(None));
+
     info!("Executor started");
 
     loop {
@@ -108,27 +126,42 @@ pub async fn run(
         };
 
         // ── Slot-staleness guard ─────────────────────────────────────
-        // Fetch current slot from the RPC. If the opportunity is older than
-        // max_opportunity_age_slots, drop it without any further RPC calls.
-        // This eliminates a class of wasted balance-check + quote-refresh
-        // calls on cold-queue opportunities that would fail the profitability
-        // re-check anyway. The slot fetch itself is cheap (~1ms on a nearby RPC).
-        if let Ok(current_slot) = rpc.get_slot().await {
-            let age = current_slot.saturating_sub(opp.detected_slot);
-            if age > config.max_opportunity_age_slots {
-                debug!(
-                    token        = %opp.token_mint,
-                    detected_slot = opp.detected_slot,
-                    current_slot,
-                    age_slots    = age,
-                    max_slots    = config.max_opportunity_age_slots,
-                    "Dropping stale opportunity (too old)"
-                );
-                metrics.record_stale_quote();
-                dash.send(DashEvent::ExecutorStaleQuote {
-                    token: opp.token_mint.to_string(),
-                });
-                continue;
+        // Resolve the current slot, using a short-lived cache so multiple
+        // opportunities arriving within the same Solana slot (~400 ms)
+        // share a single `get_slot` RPC call instead of each paying ~1 ms.
+        {
+            let mut cache_guard = slot_cache.lock().await;
+            let needs_refresh = cache_guard
+                .as_ref()
+                .map(|c| c.stale())
+                .unwrap_or(true);
+
+            if needs_refresh {
+                if let Ok(s) = rpc.get_slot().await {
+                    *cache_guard = Some(SlotCache {
+                        slot:       s,
+                        fetched_at: std::time::Instant::now(),
+                    });
+                }
+            }
+
+            if let Some(ref cache) = *cache_guard {
+                let age = cache.slot.saturating_sub(opp.detected_slot);
+                if age > config.max_opportunity_age_slots {
+                    debug!(
+                        token         = %opp.token_mint,
+                        detected_slot = opp.detected_slot,
+                        current_slot  = cache.slot,
+                        age_slots     = age,
+                        max_slots     = config.max_opportunity_age_slots,
+                        "Dropping stale opportunity (too old)"
+                    );
+                    metrics.record_stale_quote();
+                    dash.send(DashEvent::ExecutorStaleQuote {
+                        token: opp.token_mint.to_string(),
+                    });
+                    continue;
+                }
             }
         }
 

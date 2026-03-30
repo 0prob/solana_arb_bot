@@ -138,6 +138,8 @@ pub async fn run(
     let subscribe_request = build_subscribe_request(&dex_map);
 
     let mut reconnect_attempt: u32 = 0;
+    // Consecutive error count — reset on any clean exit; drives exponential backoff.
+    let mut consecutive_errors: u32 = 0;
 
     loop {
         if cancel.is_cancelled() {
@@ -151,21 +153,37 @@ pub async fn run(
 
         match result {
             Ok(()) => {
+                // Clean exit (server closed the stream). Reset error backoff and
+                // reconnect quickly — this is normal behaviour on rolling restarts.
+                consecutive_errors = 0;
+                reconnect_attempt  = reconnect_attempt.saturating_add(1);
                 warn!("gRPC stream ended cleanly — reconnecting in 2s");
-                reconnect_attempt += 1;
                 dash.send(DashEvent::ListenerReconnecting { attempt: reconnect_attempt });
             }
             Err(ref e) => {
-                error!(error = %e, "gRPC stream error — reconnecting in 5s");
-                reconnect_attempt += 1;
+                consecutive_errors = consecutive_errors.saturating_add(1);
+                reconnect_attempt  = reconnect_attempt.saturating_add(1);
+                // Exponential backoff: 5s, 10s, 20s, 40s — hard capped at 60s.
+                let delay_secs = (5u64 * (1u64 << consecutive_errors.min(4))).min(60);
+                error!(
+                    error            = %e,
+                    consecutive_errs = consecutive_errors,
+                    delay_secs,
+                    "gRPC stream error — reconnecting with backoff"
+                );
                 dash.send(DashEvent::ListenerReconnecting { attempt: reconnect_attempt });
+                tokio::select! {
+                    _ = cancel.cancelled() => return Ok(()),
+                    _ = tokio::time::sleep(std::time::Duration::from_secs(delay_secs)) => {},
+                }
+                continue;
             }
         }
 
-        let delay = if result.is_ok() { 2 } else { 5 };
+        // Clean exit delay — short, no backoff needed.
         tokio::select! {
             _ = cancel.cancelled() => return Ok(()),
-            _ = tokio::time::sleep(std::time::Duration::from_secs(delay)) => {},
+            _ = tokio::time::sleep(std::time::Duration::from_secs(2)) => {},
         }
     }
 }
@@ -234,7 +252,19 @@ async fn run_subscription(
     let uses_tls = endpoint.starts_with("https://");
 
     let mut builder = GeyserGrpcClient::build_from_shared(endpoint.clone())?
-        .x_token(x_token)?;
+        .x_token(x_token)?
+        // Abort the connect attempt after 10 s instead of hanging indefinitely.
+        .connect_timeout(std::time::Duration::from_secs(10))
+        // HTTP/2 keepalive pings every 15 s — detects silently-dead connections
+        // that would otherwise block the stream.recv() forever.
+        .http2_keep_alive_interval(std::time::Duration::from_secs(15))
+        // Consider the connection dead if no keepalive ACK arrives within 5 s.
+        .keep_alive_timeout(std::time::Duration::from_secs(5))
+        // Send keepalives even when there are no in-flight RPCs.  Required here
+        // because the subscription is long-lived with no request traffic.
+        .keep_alive_while_idle(true)
+        // Disable Nagle's algorithm — gRPC messages should be sent immediately.
+        .tcp_nodelay(true);
 
     if uses_tls {
         builder = builder
