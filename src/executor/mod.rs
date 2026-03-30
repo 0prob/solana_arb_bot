@@ -514,7 +514,7 @@ async fn get_dynamic_priority_fee(
             } else {
                 p75
                     .max(config.priority_fee_micro_lamports)
-                    .min(config.priority_fee_micro_lamports * 10)
+                    .min(config.priority_fee_micro_lamports.saturating_mul(10))
             };
 
             debug!(

@@ -30,6 +30,7 @@ mod tui;
 use anyhow::Result;
 use clap::Parser;
 use std::sync::Arc;
+use std::time::Duration;
 use tokio::sync::mpsc;
 use tokio_util::sync::CancellationToken;
 use tracing::error;
@@ -77,7 +78,7 @@ async fn main() -> Result<()> {
     let (migration_tx, migration_rx) = mpsc::channel(128);
     let (opportunity_tx, opportunity_rx) = mpsc::channel(32);
 
-    let listener_handle = {
+    let mut listener_handle = {
         let cfg = config.clone();
         let cancel = cancel.clone();
         let d = dash.clone();
@@ -88,7 +89,7 @@ async fn main() -> Result<()> {
         })
     };
 
-    let scanner_handle = {
+    let mut scanner_handle = {
         let cfg = config.clone();
         let cancel = cancel.clone();
         let m = metrics.clone();
@@ -100,7 +101,7 @@ async fn main() -> Result<()> {
         })
     };
 
-    let executor_handle = {
+    let mut executor_handle = {
         let cfg = config.clone();
         let cancel = cancel.clone();
         let m = metrics.clone();
@@ -112,16 +113,29 @@ async fn main() -> Result<()> {
         })
     };
 
+    // Use mutable references so the JoinHandles are NOT consumed by select!
+    // and remain available for the graceful-shutdown join below.
     tokio::select! {
         _ = cancel.cancelled() => {}
-        r = listener_handle  => { if let Err(e) = r { error!(error = %e, "Listener panicked"); } }
-        r = scanner_handle   => { if let Err(e) = r { error!(error = %e, "Scanner panicked"); } }
-        r = executor_handle  => { if let Err(e) = r { error!(error = %e, "Executor panicked"); } }
+        r = &mut listener_handle  => { if let Err(e) = r { error!(error = %e, "Listener panicked"); } }
+        r = &mut scanner_handle   => { if let Err(e) = r { error!(error = %e, "Scanner panicked"); } }
+        r = &mut executor_handle  => { if let Err(e) = r { error!(error = %e, "Executor panicked"); } }
     }
 
-    dash.send(tui::DashEvent::Shutdown);
+    // Broadcast shutdown to all subsystems and the dashboard.
     cancel.cancel();
-    tokio::time::sleep(std::time::Duration::from_millis(700)).await;
+    dash.send(tui::DashEvent::Shutdown);
+
+    // Wait up to 3 s for each task to drain and exit cleanly.  Each task's loop
+    // polls cancel.cancelled() so it will exit promptly.  The timeout prevents
+    // a hung task (e.g. a blocked RPC call) from stalling the process forever.
+    let _ = tokio::time::timeout(
+        Duration::from_secs(3),
+        async {
+            let _ = tokio::join!(listener_handle, scanner_handle, executor_handle);
+        },
+    )
+    .await;
 
     Ok(())
 }

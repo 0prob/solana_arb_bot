@@ -135,7 +135,7 @@ pub async fn run(
 
     // Build the subscription request once — it is immutable across reconnects
     // because the DEX registry is a static slice. Cloning it is cheap.
-    let subscribe_request = build_subscribe_request(&dex_map);
+    let subscribe_request = build_subscribe_request();
 
     let mut reconnect_attempt: u32 = 0;
     // Consecutive error count — reset on any clean exit; drives exponential backoff.
@@ -161,10 +161,11 @@ pub async fn run(
                 dash.send(DashEvent::ListenerReconnecting { attempt: reconnect_attempt });
             }
             Err(ref e) => {
+                // Compute delay BEFORE incrementing so the first error gets 5 s
+                // (not 10 s).  Schedule: 5 → 10 → 20 → 40 → 60 s (hard cap).
+                let delay_secs = (5u64 * (1u64 << consecutive_errors.min(4))).min(60);
                 consecutive_errors = consecutive_errors.saturating_add(1);
                 reconnect_attempt  = reconnect_attempt.saturating_add(1);
-                // Exponential backoff: 5s, 10s, 20s, 40s — hard capped at 60s.
-                let delay_secs = (5u64 * (1u64 << consecutive_errors.min(4))).min(60);
                 error!(
                     error            = %e,
                     consecutive_errs = consecutive_errors,
@@ -198,12 +199,11 @@ fn build_dex_lookup() -> HashMap<Pubkey, &'static str> {
         .collect()
 }
 
-/// Build the gRPC SubscribeRequest once from the DEX lookup map.
+/// Build the gRPC SubscribeRequest once from the DEX registry.
 /// One transaction filter is created per detectable DEX program.
-fn build_subscribe_request(dex_map: &HashMap<Pubkey, &'static str>) -> SubscribeRequest {
+fn build_subscribe_request() -> SubscribeRequest {
     let mut transactions: HashMap<String, SubscribeRequestFilterTransactions> = HashMap::new();
 
-    // We need the full DEX registry (not just the lookup map) to get program ID strings.
     for entry in dex_registry::detectable_dexes() {
         let program_str = entry.program_id.to_string();
         let key = entry.label.to_ascii_lowercase().replace(' ', "_");
@@ -212,7 +212,10 @@ fn build_subscribe_request(dex_map: &HashMap<Pubkey, &'static str>) -> Subscribe
             SubscribeRequestFilterTransactions {
                 vote:             Some(false),
                 failed:           Some(false),
-                account_include:  vec![program_str.clone()],
+                // account_required (AND): the program MUST appear in the TX.
+                // account_include (OR) with a single account is redundant here —
+                // account_required alone is the correct and sufficient filter.
+                account_include:  vec![],
                 account_exclude:  vec![],
                 account_required: vec![program_str],
                 signature:        None,
@@ -445,6 +448,15 @@ fn scan_instructions<'a>(
 
 /// Scan inner instruction groups (CPIs) for pool creation events.
 /// Returns the first match, or None.
+///
+/// In yellowstone-grpc-proto 12.x `InnerInstruction` exposes fields directly
+/// (program_id_index, accounts, data) without wrapping a CompiledInstruction.
+///
+/// Performance note: we pre-filter by DEX program ID *before* constructing a
+/// CompiledInstruction.  A typical transaction has many CPI instructions
+/// (SPL-token transfers, system transfers, etc.) that do not target any DEX.
+/// Skipping the accounts/data clone for non-matching instructions avoids
+/// unnecessary heap allocations on the hot path.
 fn scan_inner_instructions(
     inner_groups: &[InnerInstructions],
     dex_map: &HashMap<Pubkey, &'static str>,
@@ -453,30 +465,36 @@ fn scan_inner_instructions(
     slot: u64,
 ) -> Option<MigrationEvent> {
     for group in inner_groups {
-        // In yellowstone-grpc-proto 12.x, InnerInstruction no longer wraps a
-        // CompiledInstruction via an `.instruction` field. The fields
-        // (program_id_index, accounts, data, stack_height) are now exposed
-        // directly on InnerInstruction itself. We reconstruct a
-        // CompiledInstruction from those flat fields so the existing
-        // scan_instructions() pipeline can consume them unchanged.
-        let compiled_ixs: Vec<CompiledInstruction> = group
-            .instructions
-            .iter()
-            .map(|inner| CompiledInstruction {
+        for inner in &group.instructions {
+            // Resolve the program ID first — no allocation needed.
+            let program_id = match account_index(account_table, inner.program_id_index as usize) {
+                Some(pk) => pk,
+                None     => continue,
+            };
+
+            let dex_label = match dex_map.get(&program_id) {
+                Some(label) => *label,
+                None        => continue,  // Not a DEX we monitor — skip
+            };
+
+            // Only now construct the CompiledInstruction (clones accounts+data).
+            // This is reached only for instructions that target a known DEX,
+            // which is rare in the CPI tree of a typical transaction.
+            let ix = CompiledInstruction {
                 program_id_index: inner.program_id_index,
                 accounts:         inner.accounts.clone(),
                 data:             inner.data.clone(),
-            })
-            .collect();
+            };
 
-        if let Some(event) = scan_instructions(
-            compiled_ixs.iter(),
-            dex_map,
-            account_table,
-            signature,
-            slot,
-        ) {
-            return Some(event);
+            let maybe_event = match dex_label {
+                "PumpSwap"   => parse_pumpswap(&ix, account_table, signature, slot),
+                "Raydium V4" => parse_raydium_v4(&ix, account_table, signature, slot),
+                _            => parse_generic(&ix, dex_label, account_table, signature, slot),
+            };
+
+            if maybe_event.is_some() {
+                return maybe_event;
+            }
         }
     }
     None

@@ -638,9 +638,23 @@ fn draw_footer(f: &mut Frame, area: Rect) {
 
 // ── Utilities ────────────────────────────────────────────────────────
 
+/// Truncate `s` to at most `max` *characters*, appending "…" if truncated.
+///
+/// `s[..n]` with a byte index that falls inside a multi-byte character causes
+/// a panic.  We resolve the cut point via `char_indices` so the boundary is
+/// always valid, regardless of whether the input is ASCII or arbitrary UTF-8.
 fn shorten(s: &str, max: usize) -> String {
-    if s.len() <= max { s.to_string() }
-    else { format!("{}…", &s[..max.saturating_sub(1)]) }
+    let char_count = s.chars().count();
+    if char_count <= max {
+        return s.to_string();
+    }
+    // Find the byte offset of the (max-1)-th character to leave room for "…".
+    let cut = s
+        .char_indices()
+        .nth(max.saturating_sub(1))
+        .map(|(byte_idx, _)| byte_idx)
+        .unwrap_or(s.len());
+    format!("{}…", &s[..cut])
 }
 
 fn split_h(area: Rect, left_w: u16, right_w: u16) -> [Rect; 2] {

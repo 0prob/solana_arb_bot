@@ -169,34 +169,40 @@ impl DeduplicatorSet {
         });
     }
 
-    /// Returns `true` if this key was already seen within the TTL window.
+    /// Returns `true` if `key` was already seen within the TTL window.
     ///
-    /// Uses `entry().or_insert_with()` for an atomic check-and-insert within
-    /// the DashMap shard lock, eliminating the TOCTOU race that existed in the
-    /// previous two-phase get_mut+insert approach.
+    /// Uses a single `entry()` call so the shard write-lock is held for the
+    /// entire check-and-insert operation.  This eliminates the TOCTOU window
+    /// that existed in the previous two-phase `get_mut` → `entry()` approach,
+    /// where two concurrent tasks with the same brand-new key could both pass
+    /// the `get_mut` check, then both call `entry().or_insert()`, and both
+    /// return `false` — incorrectly treating a duplicate as new.
     ///
-    /// If the entry already exists and is not expired, we update its timestamp
-    /// and return true. If the entry is new (or was absent), we insert and return false.
+    /// Behaviour:
+    ///   • Key present, TTL not expired → `true`  (genuine duplicate)
+    ///   • Key present, TTL expired     → refresh timestamp, `false` (treat as new)
+    ///   • Key absent                   → insert with current timestamp, `false`
     ///
-    /// One string allocation occurs only for genuinely new keys, same as before.
+    /// Cost: one `String` allocation per call (DashMap `entry` takes `K` by value).
+    /// For Solana signatures (88 ASCII bytes) this is negligible.
     pub fn is_duplicate(&self, key: &str) -> bool {
+        use dashmap::mapref::entry::Entry;
+
         let now = std::time::Instant::now();
 
-        // Fast path: check with a shared read shard-lock before allocating.
-        // DashMap's get() holds only the shard read-lock — no write contention.
-        if let Some(mut ts) = self.seen.get_mut(key) {
-            if now.duration_since(*ts) < self.ttl {
-                return true;
+        match self.seen.entry(key.to_string()) {
+            Entry::Occupied(mut occ) => {
+                if now.duration_since(*occ.get()) < self.ttl {
+                    true  // Still fresh — genuine duplicate
+                } else {
+                    *occ.get_mut() = now;  // Expired — refresh in place, treat as new
+                    false
+                }
             }
-            // Expired entry — refresh in place, treat as new.
-            *ts = now;
-            return false;
+            Entry::Vacant(v) => {
+                v.insert(now);
+                false
+            }
         }
-
-        // Slow path: new key. Use entry() for atomic insert, avoiding TOCTOU.
-        // entry() acquires the shard write-lock atomically, so concurrent calls
-        // with the same key on different tokio tasks will not both see "new".
-        self.seen.entry(key.to_string()).or_insert(now);
-        false
     }
 }

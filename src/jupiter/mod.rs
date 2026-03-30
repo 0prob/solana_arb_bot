@@ -94,7 +94,15 @@ impl JupiterClient {
         let request = SwapInstructionsRequest {
             user_public_key: user_pubkey.to_string(),
             quote_response: quote_json,
-            wrap_and_unwrap_sol: Some(true),
+            // MUST be false for flash-loan context.
+            //
+            // The flash-loan borrow puts WSOL into the fee-payer's ATA; the
+            // flash-loan repay pulls WSOL back out of the same ATA.  Setting
+            // wrap_and_unwrap_sol = true would cause Jupiter to append an
+            // "unwrap WSOL → native SOL" instruction after the sell swap,
+            // emptying the ATA before the repay instruction can draw from it —
+            // the repay then fails with an insufficient-funds error.
+            wrap_and_unwrap_sol: Some(false),
             compute_unit_price_micro_lamports: None,
             as_legacy_transaction: Some(false),
             dynamic_compute_unit_limit: Some(true),
