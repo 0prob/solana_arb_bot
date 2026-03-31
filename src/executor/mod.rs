@@ -64,6 +64,10 @@ struct ExecutionOutcome {
     provider: FlashLoanProvider,
     priority_fee_micro_lamports: u64,
     tip_lamports: u64,
+    /// Net expected wallet gain: fresh_profit minus the extra Jito tip above
+    /// the floor tip that is already baked into estimated_tx_cost(). This is
+    /// the authoritative figure reported to metrics and the TUI.
+    net_profit_lamports: u64,
     via_jito: bool,
 }
 
@@ -194,28 +198,28 @@ pub async fn run(
                 breaker.record_success();
 
                 let tip = outcome.tip_lamports;
+                let net  = outcome.net_profit_lamports;
                 let actual_priority_fee_lamports = (outcome.priority_fee_micro_lamports as u128
                     * config.compute_unit_limit as u128
                     / 1_000_000) as u64;
 
-                metrics.record_confirmed(
-                    opp.expected_profit_lamports,
-                    tip,
-                    actual_priority_fee_lamports,
-                );
+                // Record the *net* profit (after the dynamic Jito tip overhead
+                // above the floor), not the scanner's gross estimate.
+                metrics.record_confirmed(net, tip, actual_priority_fee_lamports);
 
                 info!(
-                    signature   = %outcome.signature,
-                    provider    = outcome.provider.label(),
-                    token       = %opp.token_mint,
-                    expected_profit_sol = opp.expected_profit_lamports as f64 / 1e9,
+                    signature       = %outcome.signature,
+                    provider        = outcome.provider.label(),
+                    token           = %opp.token_mint,
+                    net_profit_sol  = net as f64 / 1e9,
+                    tip_sol         = tip as f64 / 1e9,
                     "Arb transaction confirmed"
                 );
 
                 dash.send(DashEvent::ExecutorConfirmed {
                     token:      token_str,
                     signature:  outcome.signature.clone(),
-                    profit_sol: opp.expected_profit_lamports as f64 / 1e9,
+                    profit_sol: net as f64 / 1e9,
                     tip_sol:    tip as f64 / 1e9,
                     fee_sol:    actual_priority_fee_lamports as f64 / 1e9,
                     via_jito:   outcome.via_jito,
@@ -319,21 +323,51 @@ async fn execute_arb(
         tx_cost,
     )?;
 
-    if fresh_profit <= 0 || (fresh_profit as u64) < config.min_profit_lamports {
+    // ── Tip computation (must happen before the net-profit gate) ────────
+    //
+    // estimated_tx_cost() already subtracts jito_tip_floor_lamports from the
+    // gross arb spread, so fresh_profit is "gross profit minus floor tip".
+    // If the dynamic tip exceeds the floor, the delta is an additional cost
+    // that must be deducted before comparing against min_profit_lamports.
+    //
+    // Without this, a trade where fresh_profit == min_profit with fraction=0.5
+    // would pass the gate yet net the wallet only ~50% of min_profit.
+    let tip_lamports = if jito_enabled {
+        config.dynamic_jito_tip(fresh_profit as u64)
+    } else {
+        0
+    };
+
+    // extra_tip: the portion of the dynamic tip that is NOT already accounted
+    // for in estimated_tx_cost() (which uses the floor tip).
+    let extra_tip = tip_lamports.saturating_sub(config.jito_tip_floor_lamports);
+
+    // Actual expected wallet gain after all costs: gross spread minus
+    // priority fee, base fee, floor tip (already in fresh_profit), and the
+    // extra Jito tip above the floor.
+    let net_after_tip: i64 = fresh_profit - extra_tip as i64;
+
+    if net_after_tip <= 0 || (net_after_tip as u64) < config.min_profit_lamports {
         metrics.record_stale_quote();
         dash.send(DashEvent::ExecutorStaleQuote { token: token_str.to_string() });
         anyhow::bail!(
-            "Quote refresh: profit dropped to {} lamports (was {})",
+            "Quote refresh: net profit after tip {} lamports (gross {}, tip {}) is below minimum {}",
+            net_after_tip,
             fresh_profit,
-            opp.expected_profit_lamports
+            tip_lamports,
+            config.min_profit_lamports,
         );
     }
 
     debug!(
-        original_profit = opp.expected_profit_lamports,
+        original_profit       = opp.expected_profit_lamports,
         fresh_profit,
-        candidate_providers = provider_candidates.len(),
-        "Quote refresh passed"
+        tip_lamports,
+        extra_tip,
+        net_after_tip,
+        tip_fraction          = config.jito_tip_profit_fraction,
+        candidate_providers   = provider_candidates.len(),
+        "Quote refresh passed — net profit after tip is above minimum"
     );
 
     // ── Swap instructions ────────────────────────────────────────────
@@ -348,26 +382,8 @@ async fn execute_arb(
     // ── Dynamic priority fee with account context ────────────────────
     // Passing the writable accounts from the swap gives the RPC a more
     // accurate picture of recent fees for those specific accounts, which
-    // are often congested during token migration windows. This produces a
-    // higher-quality fee estimate than the global (empty-accounts) query
-    // and improves landing rate on competitive slots.
+    // are often congested during token migration windows.
     let priority_fee  = get_dynamic_priority_fee(rpc, config, &payer_pubkey, &wsol_mint).await;
-
-    // ── Tip computation — use FRESH profit, not the stale scanner estimate ──
-    // Using opp.expected_profit_lamports here over-tips when profit has decayed.
-    // fresh_profit is a signed i64 and we've already confirmed it's > 0.
-    let tip_lamports = if jito_enabled {
-        config.dynamic_jito_tip(fresh_profit as u64)
-    } else {
-        0
-    };
-
-    debug!(
-        tip_lamports,
-        tip_fraction          = config.jito_tip_profit_fraction,
-        fresh_profit_lamports = fresh_profit,
-        "Dynamic Jito tip computed from fresh profit"
-    );
 
     let mut attempt_errors = Vec::new();
 
@@ -398,6 +414,7 @@ async fn execute_arb(
                     provider,
                     priority_fee_micro_lamports: priority_fee,
                     tip_lamports,
+                    net_profit_lamports: net_after_tip.max(0) as u64,
                     via_jito: jito_enabled,
                 });
             }
@@ -506,16 +523,16 @@ async fn get_dynamic_priority_fee(
             let mut fee_values: Vec<u64> = fees.iter().map(|f| f.prioritization_fee).collect();
             fee_values.sort_unstable();
 
+            // p75: use index = (n * 3) / 4 (rounds down, biases slightly high —
+            // safer for landing rate).
             let p75_idx = (fee_values.len() * 75) / 100;
             let p75 = fee_values.get(p75_idx).copied().unwrap_or(0);
 
-            let dynamic = if config.priority_fee_micro_lamports == 0 {
-                p75
-            } else {
-                p75
-                    .max(config.priority_fee_micro_lamports)
-                    .min(config.priority_fee_micro_lamports.saturating_mul(10))
-            };
+            // Follow the market rate (p75) but never go below the configured
+            // floor. No upper cap: p75 is already a moderate percentile and
+            // capping it would cause the bot to under-bid during congestion,
+            // losing slots to competitors who pay the full market rate.
+            let dynamic = p75.max(config.priority_fee_micro_lamports);
 
             debug!(
                 p75_fee    = p75,

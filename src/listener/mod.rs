@@ -41,7 +41,6 @@ use anyhow::{Context, Result};
 use futures::{SinkExt, StreamExt};
 use solana_sdk::pubkey::Pubkey;
 use std::collections::HashMap;
-use std::str::FromStr;
 use std::sync::Arc;
 use tokio::sync::mpsc;
 use tokio_util::sync::CancellationToken;
@@ -104,10 +103,6 @@ const PUMPSWAP_CREATE_POOL_DISC: [u8; 8] = [0xe9, 0x92, 0xd1, 0x8e, 0xcf, 0x6c, 
 const RAYDIUM_V4_INIT2_TAG:           u8    = 1;
 const RAYDIUM_V4_INIT2_MIN_DATA_LEN:  usize = 18;
 const RAYDIUM_V4_INIT2_MIN_ACCOUNTS:  usize = 21;
-
-/// Well-known system/sysvar pubkeys used to skip non-token accounts in the
-/// generic heuristic.
-const WSOL_MINT_STR: &str = "So11111111111111111111111111111111111111112";
 
 // ── Entry point ──────────────────────────────────────────────────────
 
@@ -586,8 +581,7 @@ fn parse_pumpswap(
     let token_mint   = resolve_account(table, &ix.accounts, 2)?;
 
     // Sanity: base_mint must not be WSOL (it is the new token)
-    let wsol = Pubkey::from_str(WSOL_MINT_STR).ok()?;
-    if token_mint == wsol {
+    if token_mint == crate::config::programs::wsol_mint() {
         return None;
     }
 
@@ -629,7 +623,7 @@ fn parse_raydium_v4(
     let coin_mint    = resolve_account(table, &ix.accounts, 8)?;
     let pc_mint      = resolve_account(table, &ix.accounts, 9)?;
 
-    let wsol = Pubkey::from_str(WSOL_MINT_STR).ok()?;
+    let wsol = crate::config::programs::wsol_mint();
 
     // The non-SOL leg is the new token. Raydium pairs can be coin/WSOL or
     // WSOL/coin depending on listing direction. Pick the non-WSOL side.
@@ -672,7 +666,7 @@ fn parse_generic(
     signature: &str,
     slot: u64,
 ) -> Option<MigrationEvent> {
-    let wsol     = Pubkey::from_str(WSOL_MINT_STR).ok()?;
+    let wsol     = crate::config::programs::wsol_mint();
     let system   = solana_system_interface::program::id();
     let token_p  = crate::config::programs::token_program();
     let ata_p    = crate::config::programs::ata_program();

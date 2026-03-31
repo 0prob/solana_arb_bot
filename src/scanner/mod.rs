@@ -232,7 +232,9 @@ async fn evaluate_opportunity(
             "Simulated arb (conservative: using other_amount_threshold)"
         );
 
-        if profit > 0 && profit > min_profit && profit > best_profit {
+        // Use >= so that profit == min_profit is accepted, consistent with the
+        // executor's validate_profitability check (which rejects only < min_profit).
+        if profit > 0 && profit >= min_profit && profit > best_profit {
             best_profit = profit;
             best = Some(ArbOpportunity {
                 token_mint: *token_mint,

@@ -234,45 +234,68 @@ impl JitoClient {
                 params:  [[bundle_id]],
             };
 
-            let body: Resp = self
+            // Transient HTTP/network errors are swallowed: we log at warn and
+            // continue polling until the timeout.  Only two conditions cause
+            // an early exit:
+            //   • An RPC-level error in the JSON response body (bundle failed)
+            //   • The bundle reaches confirmed/finalized status
+            // Everything else (connection resets, 5xx, decode failures) is
+            // transient and must not be allowed to lose a bundle that may
+            // already be on-chain.
+            let body_opt: Option<Resp> = match self
                 .http
                 .post(&self.bundle_url)
                 .json(&req)
                 .send()
                 .await
-                .context("Jito getBundleStatuses request failed")?
-                .error_for_status()
-                .context("Jito getBundleStatuses HTTP error")?
-                .json()
-                .await
-                .context("Failed to decode Jito getBundleStatuses response")?;
-
-            if let Some(err) = body.error {
-                anyhow::bail!(
-                    "Jito getBundleStatuses RPC error {}: {}",
-                    err.code, err.message
-                );
-            }
-
-            if let Some(result) = body.result {
-                if let Some(Some(status)) = result.value.into_iter().next() {
-                    if let Some(err) = status.err {
-                        return Ok(BundleOutcome::Failed { reason: err.to_string() });
+            {
+                Err(e) => {
+                    warn!(bundle_id, error = %e, "getBundleStatuses HTTP error — retrying");
+                    None
+                }
+                Ok(resp) => match resp.error_for_status() {
+                    Err(e) => {
+                        warn!(bundle_id, error = %e, "getBundleStatuses HTTP status error — retrying");
+                        None
                     }
-                    if let Some(cs) = status.confirmation_status {
-                        // The Jito getBundleStatuses API returns the confirmation_status
-                        // field as a JSON string matching the Solana RPC spec:
-                        // "processed" | "confirmed" | "finalized"
-                        // We match on the lowercase string rather than Debug-formatting
-                        // an enum, which would be brittle across crate versions.
-                        let lower = cs.to_ascii_lowercase();
-                        if lower == "confirmed" || lower == "finalized" {
-                            let signature = status
-                                .transactions
-                                .and_then(|mut v| v.drain(..).next())
-                                .unwrap_or_default();
-                            info!(bundle_id, status = %lower, "Jito bundle confirmed");
-                            return Ok(BundleOutcome::Landed { signature });
+                    Ok(r) => match r.json::<Resp>().await {
+                        Err(e) => {
+                            warn!(bundle_id, error = %e, "getBundleStatuses decode error — retrying");
+                            None
+                        }
+                        Ok(b) => Some(b),
+                    },
+                },
+            };
+
+            if let Some(body) = body_opt {
+                if let Some(err) = body.error {
+                    // RPC-level error is definitive: the bundle failed or is
+                    // unknown.  No point continuing to poll.
+                    anyhow::bail!(
+                        "Jito getBundleStatuses RPC error {}: {}",
+                        err.code, err.message
+                    );
+                }
+
+                if let Some(result) = body.result {
+                    if let Some(Some(status)) = result.value.into_iter().next() {
+                        if let Some(err) = status.err {
+                            return Ok(BundleOutcome::Failed { reason: err.to_string() });
+                        }
+                        if let Some(cs) = status.confirmation_status {
+                            // The Jito getBundleStatuses API returns the confirmation_status
+                            // field as a JSON string matching the Solana RPC spec:
+                            // "processed" | "confirmed" | "finalized"
+                            let lower = cs.to_ascii_lowercase();
+                            if lower == "confirmed" || lower == "finalized" {
+                                let signature = status
+                                    .transactions
+                                    .and_then(|mut v| v.drain(..).next())
+                                    .unwrap_or_default();
+                                info!(bundle_id, status = %lower, "Jito bundle confirmed");
+                                return Ok(BundleOutcome::Landed { signature });
+                            }
                         }
                     }
                 }
