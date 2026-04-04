@@ -1,0 +1,16 @@
+# Clippy configuration for high-performance Solana bot
+msrv = "1.94.0"
+avoid-breaking-exported-api = false
+disallowed-names = ["foo", "bar", "baz", "quux"]
+cognitive-complexity-threshold = 30
+disallowed-macros = [
+    # { path = "std::panic", reason = "Avoid panics in production code" },
+    { path = "std::todo", reason = "No todo macros in production" },
+    { path = "std::unimplemented", reason = "No unimplemented macros in production" },
+]
+disallowed-methods = [
+    # { path = "std::option::Option::unwrap", reason = "Use robust error handling instead of unwrap" },
+    # { path = "std::result::Result::unwrap", reason = "Use robust error handling instead of unwrap" },
+    # { path = "std::option::Option::expect", reason = "Use robust error handling instead of expect" },
+    # { path = "std::result::Result::expect", reason = "Use robust error handling instead of expect" },
+]

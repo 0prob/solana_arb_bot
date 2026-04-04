@@ -10,7 +10,7 @@ use std::sync::OnceLock;
 
 fn shared_http_client() -> &'static Client {
     static CLIENT: OnceLock<Client> = OnceLock::new();
-    CLIENT.get_or_init(|| Client::new())
+    CLIENT.get_or_init(Client::new)
 }
 
 pub fn build_tip_instruction(payer: &Pubkey, tip_lamports: u64) -> Result<Instruction> {

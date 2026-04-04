@@ -1,0 +1,25 @@
+[advisories]
+vulnerability = "deny"
+unmaintained = "warn"
+unsound = "deny"
+notice = "warn"
+
+[licenses]
+unlicensed = "deny"
+allow = [
+    "MIT",
+    "Apache-2.0",
+    "BSD-3-Clause",
+    "ISC",
+    "OpenSSL",
+    "Zlib",
+]
+
+[bans]
+multiple-versions = "warn"
+deny = []
+
+[sources]
+unknown-registry = "deny"
+unknown-git = "deny"
+allow-git = []

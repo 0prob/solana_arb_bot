@@ -3244,6 +3244,7 @@ dependencies = [
  "tracing-subscriber",
  "yellowstone-grpc-client",
  "yellowstone-grpc-proto",
+ "zeroize",
 ]
 
 [[package]]

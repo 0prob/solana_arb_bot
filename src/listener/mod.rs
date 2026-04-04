@@ -101,10 +101,10 @@ pub async fn run(
 
                 match update.update_oneof {
                     Some(yellowstone_grpc_proto::geyser::subscribe_update::UpdateOneof::Transaction(tx_update)) => {
-                        process_transaction(&tx_update, &tx, &dex_map).await?;
+                        process_transaction(&tx_update, &tx, dex_map).await?;
                     }
                     Some(yellowstone_grpc_proto::geyser::subscribe_update::UpdateOneof::Account(acc_update)) => {
-                        process_account_update(&acc_update, &tx, &dex_map).await?;
+                        process_account_update(&acc_update, &tx, dex_map).await?;
                     }
                     _ => {}
                 }
@@ -121,18 +121,20 @@ async fn process_transaction(
 ) -> Result<()> {
     let transaction = tx_update.transaction.as_ref().context("Missing transaction")?;
     let message = transaction.transaction.as_ref().and_then(|t| t.message.as_ref()).context("Missing message")?;
-    let account_keys: Vec<Pubkey> = message.account_keys.iter().map(|k| Pubkey::try_from(k.as_slice()).unwrap()).collect();
-    
     for ix in &message.instructions {
-        let program_id = account_keys.get(ix.program_id_index as usize).context("Invalid program index")?;
-        if dex_map.contains_key(program_id) {
+        let program_id_idx = ix.program_id_index as usize;
+        let program_id_bytes = message.account_keys.get(program_id_idx).context("Invalid program index")?;
+        let program_id = Pubkey::try_from(program_id_bytes.as_slice()).map_err(|_| anyhow::anyhow!("Invalid program ID"))?;
+        
+        if dex_map.contains_key(&program_id) {
             let wsol = crate::config::programs::wsol_mint();
             for &idx in &ix.accounts {
-                let pk = account_keys.get(idx as usize).context("Invalid account index")?;
-                if pk != program_id && *pk != wsol {
+                let pk_bytes = message.account_keys.get(idx as usize).context("Invalid account index")?;
+                let pk = Pubkey::try_from(pk_bytes.as_slice()).map_err(|_| anyhow::anyhow!("Invalid account ID"))?;
+                if pk != program_id && pk != wsol {
                     debug!(token = %pk, "Pool detected via transaction");
                     let _ = tx.try_send(ArbEvent {
-                        event_type: EventType::Migration(*pk),
+                        event_type: EventType::Migration(pk),
                         slot: tx_update.slot,
                     });
                     break;

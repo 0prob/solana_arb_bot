@@ -1,6 +1,7 @@
 use anyhow::Result;
 use clap::Parser;
 use solana_sdk::{pubkey::Pubkey, signature::Keypair};
+use zeroize::Zeroize;
 use std::str::FromStr;
 use std::sync::OnceLock;
 
@@ -109,6 +110,14 @@ pub struct AppConfig {
     pub max_opportunity_age_slots: u64,
 }
 
+impl Drop for AppConfig {
+    fn drop(&mut self) {
+        // Attempt to zeroize the keypair if possible, though Keypair doesn't implement Zeroize directly
+        // We can at least zeroize the strings if they were sensitive
+        self.grpc_x_token.zeroize();
+    }
+}
+
 impl AppConfig {
     pub fn from_cli(args: CliArgs) -> Result<Self> {
         programs::validate_constants();
@@ -121,8 +130,8 @@ impl AppConfig {
             grpc_endpoint: args.grpc_endpoint,
             grpc_x_token: args.grpc_x_token,
             fee_payer,
-            min_profit_lamports: (args.min_profit_sol * 1_000_000_000.0) as u64,
-            max_loan_lamports: (args.max_loan_sol * 1_000_000_000.0) as u64,
+            min_profit_lamports: (args.min_profit_sol * 1_000_000_000.0).round() as u64,
+            max_loan_lamports: (args.max_loan_sol * 1_000_000_000.0).round() as u64,
             slippage_bps: args.slippage_bps,
             jupiter_api_url: args.jupiter_api_url,
             jito_block_engine_url: args.jito_block_engine_url,

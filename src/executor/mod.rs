@@ -5,7 +5,7 @@ use solana_sdk::{
     transaction::VersionedTransaction,
 };
 use std::sync::Arc;
-use tokio::sync::mpsc;
+use tokio::sync::{mpsc, Semaphore};
 use tokio_util::sync::CancellationToken;
 use tracing::{error, info, warn};
 use crate::config::AppConfig;
@@ -29,7 +29,8 @@ pub async fn run(
     let rpc = Arc::new(RpcClient::new(config.rpc_url.clone()));
     let jupiter = JupiterClient::new(&config.jupiter_api_url);
     let jito = JitoClient::new(&config.jito_block_engine_url);
-
+    let semaphore = Arc::new(Semaphore::new(config.scanner_max_concurrency)); // Reuse scanner concurrency for executor
+    
     info!("Executor started");
 
     loop {
@@ -41,12 +42,14 @@ pub async fn run(
             },
         };
 
+        let permit = semaphore.clone().acquire_owned().await?;
         let cfg = config.clone();
         let r = rpc.clone();
         let jup = jupiter.clone();
         let j = jito.clone();
 
         tokio::spawn(async move {
+            let _permit = permit;
             if let Err(e) = execute_opportunity(cfg, r, jup, j, opp).await {
                 error!(error = %e, "Execution failed");
             }
@@ -101,6 +104,13 @@ async fn execute_opportunity(
         recent_blockhash,
     )?;
     let tx = VersionedTransaction::try_new(solana_sdk::message::VersionedMessage::V0(message), &[&config.fee_payer])?;
+
+    // Simulation before sending
+    let sim_res = rpc.simulate_transaction(&tx).await?;
+    if let Some(err) = sim_res.value.err {
+        warn!(error = ?err, logs = ?sim_res.value.logs, "Simulation failed");
+        return Ok(());
+    }
 
     let bundle_id = jito.send_bundle(&[tx]).await?;
     info!(bundle_id, "Bundle submitted");
