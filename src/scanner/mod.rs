@@ -19,7 +19,7 @@ pub async fn run(
     let jupiter = JupiterClient::new(&config.jupiter_api_url);
     let semaphore = Arc::new(Semaphore::new(config.scanner_max_concurrency));
 
-    info!("Scanner started");
+    info!("Scanner started with Cross-DEX support");
 
     loop {
         let event = tokio::select! {
@@ -55,9 +55,14 @@ async fn evaluate_opportunity(
 
     for &amount in &loan_amounts {
         if amount == 0 { continue; }
+        
+        // Step 1: Find the best buy route (WSOL -> Token)
         let buy_quote = jupiter.quote(&wsol, &event.token_mint, amount, config.slippage_bps).await?;
         let token_out: u64 = buy_quote.other_amount_threshold.parse()?;
         if token_out == 0 { continue; }
+        
+        // Step 2: Find the best sell route (Token -> WSOL)
+        // Jupiter will automatically find the best route across all DEXes, effectively performing cross-DEX arb.
         let sell_quote = jupiter.quote(&event.token_mint, &wsol, token_out, config.slippage_bps).await?;
         
         let profit = crate::jupiter::estimate_profit(amount, &sell_quote, 0, config.estimated_tx_cost())?;
