@@ -1,0 +1,44 @@
+# ═══════════════════════════════════════════════════════════════════════════════
+#  .cargo/config.toml — Cross-compilation configuration for aarch64 (Termux)
+#
+#  To build for Termux/proot on a Pixel 9 (ARM64), run:
+#
+#    # Install the cross-compiler on your Linux build machine:
+#    sudo apt-get install gcc-aarch64-linux-gnu
+#
+#    # Build the headless (no TUI) mobile binary:
+#    cargo build --profile mobile --target aarch64-unknown-linux-gnu \
+#                --no-default-features
+#
+#    # Build with TUI (optional, higher memory cost):
+#    cargo build --profile mobile --target aarch64-unknown-linux-gnu
+#
+#  The resulting binary is at:
+#    target/aarch64-unknown-linux-gnu/mobile/sb
+#
+#  Transfer to device:
+#    adb push target/aarch64-unknown-linux-gnu/mobile/sb /data/local/tmp/sb
+#    adb shell chmod +x /data/local/tmp/sb
+#    # Then copy into proot Debian: cp /data/local/tmp/sb ~/debian/root/sb
+# ═══════════════════════════════════════════════════════════════════════════════
+
+[target.aarch64-unknown-linux-gnu]
+linker = "aarch64-linux-gnu-gcc"
+# Strip symbols at link time (additional size reduction beyond Cargo strip=true).
+rustflags = [
+    "-C", "link-arg=-s",
+    "-C", "target-cpu=generic",
+    # Enable NEON SIMD for ARM64 (available on all Snapdragon 8 Gen 3 devices).
+    "-C", "target-feature=+neon",
+]
+
+[build]
+# Default to native target for local dev; override with --target for cross-compile.
+# target = "aarch64-unknown-linux-gnu"
+
+[net]
+# Retry fetching crates on transient network errors (useful on mobile hotspot).
+retry = 3
+
+[registries.crates-io]
+protocol = "sparse"

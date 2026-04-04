@@ -1,9 +1,8 @@
 use anyhow::Result;
 use clap::Parser;
 use solana_sdk::{pubkey::Pubkey, signature::Keypair};
-use zeroize::Zeroize;
 use std::str::FromStr;
-use std::sync::OnceLock;
+use std::sync::{OnceLock, Arc};
 
 pub mod programs {
     use super::*;
@@ -105,28 +104,36 @@ pub struct CliArgs {
     /// Force compact TUI layout (useful for small terminals).
     #[arg(long, env = "TUI_COMPACT", default_value = "false")]
     pub tui_compact: bool,
+    /// Skip transaction simulation (saves 1 RPC round-trip; recommended on mobile).
+    #[arg(long, env = "SKIP_SIMULATION", default_value = "true")]
+    pub skip_simulation: bool,
+    /// Maximum RSS memory in MB before resource guard throttles the scanner.
+    #[arg(long, env = "MAX_MEMORY_MB", default_value = "2500")]
+    pub max_memory_mb: u64,
 }
 
 pub struct AppConfig {
-    pub rpc_url: String,
-    pub grpc_endpoint: String,
-    pub grpc_x_token: String,
+    pub rpc_url: Arc<str>,
+    pub grpc_endpoint: Arc<str>,
+    pub grpc_x_token: Arc<str>,
     pub fee_payer: Keypair,
     pub min_profit_lamports: u64,
     pub max_loan_lamports: u64,
     pub slippage_bps: u16,
-    pub jupiter_api_url: String,
-    pub jito_block_engine_url: String,
+    pub jupiter_api_url: Arc<str>,
+    pub jito_block_engine_url: Arc<str>,
     pub jito_tip_profit_fraction: f64,
     pub scanner_max_concurrency: usize,
     pub max_opportunity_age_slots: u64,
+    /// Skip transaction simulation to save 1 RPC round-trip (recommended on mobile).
+    pub skip_simulation: bool,
+    /// Maximum allowed RSS memory in MB before the resource guard triggers throttling.
+    pub max_memory_mb: u64,
 }
 
 impl Drop for AppConfig {
     fn drop(&mut self) {
-        // Attempt to zeroize the keypair if possible, though Keypair doesn't implement Zeroize directly
-        // We can at least zeroize the strings if they were sensitive
-        self.grpc_x_token.zeroize();
+        // Drop implementation for AppConfig
     }
 }
 
@@ -138,18 +145,20 @@ impl AppConfig {
             .map_err(|e| anyhow::anyhow!("Invalid keypair: {e}"))?;
 
         Ok(Self {
-            rpc_url: args.rpc_url,
-            grpc_endpoint: args.grpc_endpoint,
-            grpc_x_token: args.grpc_x_token,
+            rpc_url: args.rpc_url.into(),
+            grpc_endpoint: args.grpc_endpoint.into(),
+            grpc_x_token: args.grpc_x_token.into(),
             fee_payer,
             min_profit_lamports: (args.min_profit_sol * 1_000_000_000.0).round() as u64,
             max_loan_lamports: (args.max_loan_sol * 1_000_000_000.0).round() as u64,
             slippage_bps: args.slippage_bps,
-            jupiter_api_url: args.jupiter_api_url,
-            jito_block_engine_url: args.jito_block_engine_url,
+            jupiter_api_url: args.jupiter_api_url.into(),
+            jito_block_engine_url: args.jito_block_engine_url.into(),
             jito_tip_profit_fraction: args.jito_tip_profit_fraction,
             scanner_max_concurrency: args.scanner_max_concurrency,
             max_opportunity_age_slots: args.max_opportunity_age_slots,
+            skip_simulation: args.skip_simulation,
+            max_memory_mb: args.max_memory_mb,
         })
     }
 

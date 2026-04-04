@@ -1,3 +1,4 @@
+#![cfg(feature = "tui")]
 use ratatui::{
     layout::{Constraint, Direction, Layout, Rect},
     style::{Color, Modifier, Style},

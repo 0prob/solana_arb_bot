@@ -1,4 +1,5 @@
 #![allow(dead_code)]
+#![cfg(feature = "tui")]
 /// Events pushed into the TUI from the rest of the bot.
 /// These are sent over an `mpsc::Sender<TuiEvent>` and consumed
 /// exclusively by the TUI task, so no locking is required.

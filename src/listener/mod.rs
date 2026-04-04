@@ -11,12 +11,17 @@ use yellowstone_grpc_proto::geyser::{
 use futures::StreamExt;
 use crate::config::AppConfig;
 
-pub const MIGRATION_CHANNEL_CAPACITY: usize = 512;
+/// Bounded migration channel — 64 slots prevents OOM under burst.
+/// Events beyond capacity are dropped via try_send (non-blocking).
+pub const MIGRATION_CHANNEL_CAPACITY: usize = 64;
+
+/// Maximum reconnection backoff in seconds.
+const MAX_BACKOFF_SECS: u64 = 60;
 
 #[derive(Debug, Clone)]
 pub enum EventType {
     Migration(Pubkey),
-    Liquidation(Pubkey), // Pubkey of the obligation account
+    Liquidation(Pubkey),
 }
 
 #[derive(Debug, Clone)]
@@ -30,17 +35,57 @@ pub async fn run(
     tx: mpsc::Sender<ArbEvent>,
     cancel: CancellationToken,
 ) -> Result<()> {
-    let mut client = GeyserGrpcClient::build_from_shared(config.grpc_endpoint.clone())?
-        .x_token(Some(&config.grpc_x_token))?
+    let mut backoff_secs: u64 = 5;
+
+    loop {
+        if cancel.is_cancelled() {
+            return Ok(());
+        }
+
+        match run_inner(&config, &tx, &cancel).await {
+            Ok(()) => {
+                // Graceful shutdown via cancellation token.
+                return Ok(());
+            }
+            Err(e) => {
+                if cancel.is_cancelled() {
+                    return Ok(());
+                }
+                warn!(
+                    error = %e,
+                    backoff_secs,
+                    "gRPC listener error — reconnecting with backoff"
+                );
+                tokio::select! {
+                    _ = cancel.cancelled() => return Ok(()),
+                    _ = tokio::time::sleep(std::time::Duration::from_secs(backoff_secs)) => {}
+                }
+                backoff_secs = (backoff_secs * 2).min(MAX_BACKOFF_SECS);
+            }
+        }
+    }
+}
+
+async fn run_inner(
+    config: &Arc<AppConfig>,
+    tx: &mpsc::Sender<ArbEvent>,
+    cancel: &CancellationToken,
+) -> Result<()> {
+    let mut client = GeyserGrpcClient::build_from_shared(config.grpc_endpoint.to_string())?
+        .x_token(Some(config.grpc_x_token.as_ref()))?
         .tls_config(tonic::transport::ClientTlsConfig::new().with_native_roots())?
         .connect_timeout(std::time::Duration::from_secs(10))
-        .timeout(std::time::Duration::from_secs(10))
+        .timeout(std::time::Duration::from_secs(30))
         .connect()
-        .await?;
+        .await
+        .context("gRPC connect")?;
 
+    // ── Build subscription filters ────────────────────────────────────────
+    // Subscribe to transactions only for known DEX programs (not all txns).
+    // This dramatically reduces gRPC stream volume on mobile.
     let mut transactions = std::collections::HashMap::new();
     transactions.insert(
-        "migration".to_string(),
+        "arb".to_string(),
         SubscribeRequestFilterTransactions {
             vote: Some(false),
             failed: Some(false),
@@ -66,7 +111,7 @@ pub async fn run(
         );
     }
 
-    // Subscribe to lending protocols for liquidations
+    // Subscribe to lending protocols for liquidation detection.
     let lending_programs = crate::config::programs::lending_programs();
     for program_id in &lending_programs {
         accounts.insert(
@@ -81,162 +126,127 @@ pub async fn run(
     }
 
     let request = SubscribeRequest {
-        transactions: transactions.clone(),
-        accounts: accounts.clone(),
+        transactions,
+        accounts,
         ..Default::default()
     };
 
-    let (_, mut stream) = client.subscribe_with_request(Some(request)).await?;
+    let (_, mut stream) = client
+        .subscribe_with_request(Some(request))
+        .await
+        .context("gRPC subscribe")?;
+
     info!(
-        provider = "tatum",
         endpoint = %config.grpc_endpoint,
         dex_count = dex_map.len(),
         lending_count = lending_programs.len(),
-        "gRPC subscription active — listening for opportunities"
+        "gRPC subscription active"
     );
 
     loop {
         tokio::select! {
-            _ = cancel.cancelled() => break,
+            _ = cancel.cancelled() => return Ok(()),
             update = stream.next() => {
                 let update = match update {
                     Some(Ok(u)) => u,
-                    Some(Err(e)) => {
-                        warn!(
-                            error = %e,
-                            delay_secs = 5,
-                            "gRPC stream message error — reconnecting with backoff"
-                        );
-                        // Reconnection logic with backoff
-                        tokio::time::sleep(std::time::Duration::from_secs(5)).await;
-                        match GeyserGrpcClient::build_from_shared(config.grpc_endpoint.clone())?
-                            .x_token(Some(&config.grpc_x_token))?
-                            .tls_config(tonic::transport::ClientTlsConfig::new().with_native_roots())?
-                            .connect()
-                            .await 
-                        {
-                            Ok(new_client) => {
-                                client = new_client;
-                                let request = SubscribeRequest {
-                                    transactions: transactions.clone(),
-                                    accounts: accounts.clone(),
-                                    ..Default::default()
-                                };
-                                match client.subscribe_with_request(Some(request)).await {
-                                    Ok((_, new_stream)) => {
-                                        stream = new_stream;
-                                        info!("Successfully reconnected to gRPC");
-                                        continue;
-                                    }
-                                    Err(re_err) => {
-                                        warn!(error = %re_err, "Failed to resubscribe after reconnection");
-                                        continue;
-                                    }
-                                }
-                            }
-                            Err(conn_err) => {
-                                warn!(error = %conn_err, "Failed to reconnect to gRPC");
-                                continue;
-                            }
-                        }
-                    }
-                    None => {
-                        warn!(
-                            delay_secs = 5,
-                            "gRPC stream ended unexpectedly — reconnecting"
-                        );
-                        tokio::time::sleep(std::time::Duration::from_secs(5)).await;
-                        // Similar reconnection logic for stream end
-                        if let Ok(new_client) = GeyserGrpcClient::build_from_shared(config.grpc_endpoint.clone())?
-                            .x_token(Some(&config.grpc_x_token))?
-                            .tls_config(tonic::transport::ClientTlsConfig::new().with_native_roots())?
-                            .connect()
-                            .await 
-                        {
-                            client = new_client;
-                            let request = SubscribeRequest {
-                                transactions: transactions.clone(),
-                                accounts: accounts.clone(),
-                                ..Default::default()
-                            };
-                            if let Ok((_, new_stream)) = client.subscribe_with_request(Some(request)).await {
-                                stream = new_stream;
-                                info!("Successfully reconnected to gRPC after stream end");
-                                continue;
-                            }
-                        }
-                        break;
-                    }
+                    Some(Err(e)) => return Err(e.into()),
+                    None => return Err(anyhow::anyhow!("gRPC stream ended")),
                 };
 
                 match update.update_oneof {
                     Some(yellowstone_grpc_proto::geyser::subscribe_update::UpdateOneof::Transaction(tx_update)) => {
-                        process_transaction(&tx_update, &tx, dex_map).await?;
+                        process_transaction(&tx_update, tx, dex_map).await;
                     }
                     Some(yellowstone_grpc_proto::geyser::subscribe_update::UpdateOneof::Account(acc_update)) => {
-                        process_account_update(&acc_update, &tx, dex_map).await?;
+                        process_account_update(&acc_update, tx, dex_map).await;
                     }
                     _ => {}
                 }
             }
         }
     }
-    Ok(())
 }
 
+#[inline]
 async fn process_transaction(
     tx_update: &yellowstone_grpc_proto::geyser::SubscribeUpdateTransaction,
     tx: &mpsc::Sender<ArbEvent>,
     dex_map: &dashmap::DashMap<Pubkey, &'static str>,
-) -> Result<()> {
-    let transaction = tx_update.transaction.as_ref().context("Missing transaction")?;
-    let message = transaction.transaction.as_ref().and_then(|t| t.message.as_ref()).context("Missing message")?;
+) {
+    let transaction = match tx_update.transaction.as_ref() {
+        Some(t) => t,
+        None => return,
+    };
+    let message = match transaction.transaction.as_ref().and_then(|t| t.message.as_ref()) {
+        Some(m) => m,
+        None => return,
+    };
+
     for ix in &message.instructions {
         let program_id_idx = ix.program_id_index as usize;
-        let program_id_bytes = message.account_keys.get(program_id_idx).context("Invalid program index")?;
-        let program_id = Pubkey::try_from(program_id_bytes.as_slice()).map_err(|_| anyhow::anyhow!("Invalid program ID"))?;
-        
+        let program_id_bytes = match message.account_keys.get(program_id_idx) {
+            Some(b) => b,
+            None => continue,
+        };
+        let program_id = match Pubkey::try_from(program_id_bytes.as_slice()) {
+            Ok(pk) => pk,
+            Err(_) => continue,
+        };
+
         if dex_map.contains_key(&program_id) {
             let wsol = crate::config::programs::wsol_mint();
             for &idx in &ix.accounts {
-                let pk_bytes = message.account_keys.get(idx as usize).context("Invalid account index")?;
-                let pk = Pubkey::try_from(pk_bytes.as_slice()).map_err(|_| anyhow::anyhow!("Invalid account ID"))?;
+                let pk_bytes = match message.account_keys.get(idx as usize) {
+                    Some(b) => b,
+                    None => continue,
+                };
+                let pk = match Pubkey::try_from(pk_bytes.as_slice()) {
+                    Ok(pk) => pk,
+                    Err(_) => continue,
+                };
                 if pk != program_id && pk != wsol {
                     debug!(token = %pk, "Pool detected via transaction");
                     let _ = tx.try_send(ArbEvent {
                         event_type: EventType::Migration(pk),
                         slot: tx_update.slot,
                     });
-                    break;
+                    return; // Only emit one event per transaction
                 }
             }
         }
     }
-    Ok(())
 }
 
+#[inline]
 async fn process_account_update(
     acc_update: &yellowstone_grpc_proto::geyser::SubscribeUpdateAccount,
     tx: &mpsc::Sender<ArbEvent>,
     dex_map: &dashmap::DashMap<Pubkey, &'static str>,
-) -> Result<()> {
-    if let Some(account) = &acc_update.account {
-        let pk = Pubkey::try_from(account.pubkey.as_slice()).context("Invalid pubkey")?;
-        let owner = Pubkey::try_from(account.owner.as_slice()).context("Invalid owner")?;
-        
-        if dex_map.contains_key(&owner) {
-            debug!(account = %pk, "DEX account update detected, triggering scan");
-            let _ = tx.try_send(ArbEvent {
-                event_type: EventType::Migration(pk),
-                slot: acc_update.slot,
-            });
-        } else if crate::config::programs::lending_programs().contains(&owner) {
-            debug!(account = %pk, "Lending account update detected, triggering liquidation check");
-            let _ = tx.try_send(ArbEvent {
-                event_type: EventType::Liquidation(pk),
-                slot: acc_update.slot,
-            });
-        }
+) {
+    let account = match &acc_update.account {
+        Some(a) => a,
+        None => return,
+    };
+    let pk = match Pubkey::try_from(account.pubkey.as_slice()) {
+        Ok(pk) => pk,
+        Err(_) => return,
+    };
+    let owner = match Pubkey::try_from(account.owner.as_slice()) {
+        Ok(pk) => pk,
+        Err(_) => return,
+    };
+
+    if dex_map.contains_key(&owner) {
+        debug!(account = %pk, "DEX account update detected");
+        let _ = tx.try_send(ArbEvent {
+            event_type: EventType::Migration(pk),
+            slot: acc_update.slot,
+        });
+    } else if crate::config::programs::lending_programs().contains(&owner) {
+        debug!(account = %pk, "Lending account update detected");
+        let _ = tx.try_send(ArbEvent {
+            event_type: EventType::Liquidation(pk),
+            slot: acc_update.slot,
+        });
     }
-    Ok(())
 }

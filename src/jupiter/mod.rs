@@ -6,7 +6,26 @@ use solana_sdk::{
     pubkey::Pubkey,
 };
 use std::str::FromStr;
+use std::sync::OnceLock;
+use std::time::Duration;
 
+/// Process-wide shared reqwest client — avoids re-creating TLS sessions per task.
+/// Uses a 5-second timeout to prevent blocking on slow mobile networks.
+fn shared_http_client() -> &'static Client {
+    static CLIENT: OnceLock<Client> = OnceLock::new();
+    CLIENT.get_or_init(|| {
+        Client::builder()
+            .timeout(Duration::from_secs(5))
+            .tcp_keepalive(Duration::from_secs(30))
+            .pool_max_idle_per_host(4)
+            .pool_idle_timeout(Duration::from_secs(60))
+            .build()
+            .expect("Failed to build reqwest client")
+    })
+}
+
+/// Trimmed quote response — only fields we actually use.
+/// Dropping `route_plan: Vec<serde_json::Value>` saves significant heap per quote.
 #[derive(Debug, Serialize, Deserialize, Clone)]
 #[serde(rename_all = "camelCase")]
 pub struct QuoteResponse {
@@ -18,6 +37,9 @@ pub struct QuoteResponse {
     pub swap_mode: String,
     pub slippage_bps: u16,
     pub price_impact_pct: String,
+    /// Route plan retained for swap-instructions POST body, but stored as raw JSON
+    /// to avoid deserializing into typed structs we never inspect.
+    #[serde(default)]
     pub route_plan: Vec<serde_json::Value>,
 }
 
@@ -46,20 +68,22 @@ pub struct AccountMetaData {
     pub is_writable: bool,
 }
 
+/// Lightweight clone: only stores a pointer to the shared client + an Arc<str>.
 #[derive(Clone)]
 pub struct JupiterClient {
-    http: Client,
-    base_url: String,
+    http: &'static Client,
+    base_url: std::sync::Arc<str>,
 }
 
 impl JupiterClient {
     pub fn new(base_url: &str) -> Self {
         Self {
-            http: Client::new(),
-            base_url: base_url.trim_end_matches('/').to_string(),
+            http: shared_http_client(),
+            base_url: base_url.trim_end_matches('/').into(),
         }
     }
 
+    #[inline]
     pub async fn quote(
         &self,
         input_mint: &Pubkey,
@@ -71,10 +95,17 @@ impl JupiterClient {
             "{}/quote?inputMint={}&outputMint={}&amount={}&slippageBps={}",
             self.base_url, input_mint, output_mint, amount, slippage_bps
         );
-        let resp = self.http.get(&url).send().await?.error_for_status()?.json().await?;
+        let resp = self.http
+            .get(&url)
+            .send()
+            .await?
+            .error_for_status()?
+            .json()
+            .await?;
         Ok(resp)
     }
 
+    #[inline]
     pub async fn swap_instructions(
         &self,
         user_pubkey: &Pubkey,
@@ -86,11 +117,19 @@ impl JupiterClient {
             "userPublicKey": user_pubkey.to_string(),
             "wrapAndUnwrapSol": false,
         });
-        let resp = self.http.post(&url).json(&body).send().await?.error_for_status()?.json().await?;
+        let resp = self.http
+            .post(&url)
+            .json(&body)
+            .send()
+            .await?
+            .error_for_status()?
+            .json()
+            .await?;
         Ok(resp)
     }
 }
 
+#[inline]
 pub fn parse_ix(ix: &InstructionData) -> Result<Instruction> {
     let program_id = Pubkey::from_str(&ix.program_id)?;
     let accounts = ix.accounts.iter().map(|a| {
@@ -104,11 +143,13 @@ pub fn parse_ix(ix: &InstructionData) -> Result<Instruction> {
     Ok(Instruction { program_id, accounts, data })
 }
 
+#[inline]
 fn b64_deserialize(s: &str) -> Result<Vec<u8>> {
     use base64::{Engine as _, engine::general_purpose};
     general_purpose::STANDARD.decode(s).context("base64 decode")
 }
 
+#[inline]
 pub fn estimate_profit(
     loan_amount: u64,
     sell_quote: &QuoteResponse,

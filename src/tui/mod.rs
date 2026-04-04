@@ -1,3 +1,4 @@
+#![cfg(feature = "tui")]
 //! TUI module — production-grade ratatui 0.29 + crossterm 0.28 terminal UI.
 //!
 //! # Architecture

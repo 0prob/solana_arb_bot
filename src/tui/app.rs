@@ -1,13 +1,16 @@
 #![allow(dead_code)]
+#![cfg(feature = "tui")]
 use std::collections::VecDeque;
 use std::time::Instant;
 
-/// Maximum number of log lines retained in memory.
-pub const MAX_LOGS: usize = 500;
-/// Maximum number of opportunities retained in the table.
-pub const MAX_OPPORTUNITIES: usize = 50;
-/// Maximum number of profit data-points for the sparkline.
-pub const MAX_SPARKLINE: usize = 60;
+/// Maximum log lines retained in memory (mobile-safe: 100 instead of 500).
+pub const MAX_LOGS: usize = 100;
+/// Maximum opportunities retained (mobile-safe: 20 instead of 50).
+pub const MAX_OPPORTUNITIES: usize = 20;
+/// Maximum sparkline data-points (mobile-safe: 30 instead of 60).
+pub const MAX_SPARKLINE: usize = 30;
+/// Maximum bundle records retained.
+pub const MAX_BUNDLES: usize = 20;
 
 /// A single recorded arbitrage opportunity.
 #[derive(Debug, Clone)]
@@ -27,7 +30,7 @@ pub struct BundleRecord {
     pub timestamp: Instant,
 }
 
-/// Severity level for log lines, used for colour-coding.
+/// Severity level for log lines.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum LogLevel {
     Error,
@@ -49,7 +52,7 @@ impl LogLevel {
     }
 }
 
-/// A single log entry with level and message.
+/// A single log entry.
 #[derive(Debug, Clone)]
 pub struct LogEntry {
     pub level: LogLevel,
@@ -97,44 +100,27 @@ impl ActiveTab {
     }
 }
 
-/// The full application state owned exclusively by the TUI task (no locking required).
+/// The full application state owned exclusively by the TUI task.
 pub struct App {
-    // ── Lifecycle ────────────────────────────────────────────────────────
     pub should_quit: bool,
     pub paused: bool,
     pub start_time: Instant,
-
-    // ── Navigation ───────────────────────────────────────────────────────
     pub active_tab: ActiveTab,
-
-    // ── Aggregate metrics ────────────────────────────────────────────────
     pub opportunities_found: u64,
     pub bundles_submitted: u64,
     pub total_profit_sol: f64,
     pub total_tip_sol: f64,
     pub render_time_us: u64,
     pub events_processed: u64,
-
-    // ── Rich data ────────────────────────────────────────────────────────
     pub opportunities: VecDeque<OpportunityRecord>,
     pub bundles: VecDeque<BundleRecord>,
     pub logs: VecDeque<LogEntry>,
     pub profit_sparkline: VecDeque<u64>,
-
-    // ── Log filtering ────────────────────────────────────────────────────
     pub log_filter: Option<String>,
     pub log_scroll: usize,
-
-    // ── Opportunity table scroll ─────────────────────────────────────────
     pub opp_scroll: usize,
-
-    // ── Error banner ─────────────────────────────────────────────────────
     pub error_banner: Option<(String, Instant)>,
-
-    // ── Mouse support ────────────────────────────────────────────────────
     pub mouse_enabled: bool,
-
-    // ── Compact mode ─────────────────────────────────────────────────────
     pub compact: bool,
 }
 
@@ -152,7 +138,7 @@ impl App {
             render_time_us: 0,
             events_processed: 0,
             opportunities: VecDeque::with_capacity(MAX_OPPORTUNITIES),
-            bundles: VecDeque::with_capacity(50),
+            bundles: VecDeque::with_capacity(MAX_BUNDLES),
             logs: VecDeque::with_capacity(MAX_LOGS),
             profit_sparkline: VecDeque::with_capacity(MAX_SPARKLINE),
             log_filter: None,
@@ -164,19 +150,14 @@ impl App {
         }
     }
 
-    /// Record a new opportunity found by the scanner.
     pub fn add_opportunity(&mut self, token: String, loan_sol: f64, profit_sol: f64) {
-        if self.paused {
-            return;
-        }
+        if self.paused { return; }
         self.opportunities_found += 1;
-        // Sparkline: store profit in micro-SOL for integer representation.
         let micro = (profit_sol * 1_000_000.0).round() as u64;
         if self.profit_sparkline.len() >= MAX_SPARKLINE {
             self.profit_sparkline.pop_front();
         }
         self.profit_sparkline.push_back(micro);
-
         if self.opportunities.len() >= MAX_OPPORTUNITIES {
             self.opportunities.pop_front();
         }
@@ -188,12 +169,11 @@ impl App {
         });
     }
 
-    /// Record a Jito bundle submission.
     pub fn add_bundle(&mut self, bundle_id: String, profit_sol: f64, tip_sol: f64) {
         self.bundles_submitted += 1;
         self.total_profit_sol += profit_sol;
         self.total_tip_sol += tip_sol;
-        if self.bundles.len() >= 50 {
+        if self.bundles.len() >= MAX_BUNDLES {
             self.bundles.pop_front();
         }
         self.bundles.push_back(BundleRecord {
@@ -204,11 +184,9 @@ impl App {
         });
     }
 
-    /// Append a log entry.
     pub fn add_log(&mut self, level: LogLevel, target: String, message: String) {
         if self.logs.len() >= MAX_LOGS {
             self.logs.pop_front();
-            // Keep scroll position valid.
             if self.log_scroll > 0 {
                 self.log_scroll -= 1;
             }
@@ -221,17 +199,15 @@ impl App {
         });
     }
 
-    /// Set an error banner that will be displayed until cleared.
     pub fn set_error(&mut self, msg: String) {
         self.error_banner = Some((msg, Instant::now()));
     }
 
-    /// Clear the error banner.
     pub fn clear_error(&mut self) {
         self.error_banner = None;
     }
 
-    /// Filtered log view (returns indices into `self.logs`).
+    /// Filtered log view — returns indices into `self.logs`.
     pub fn filtered_logs(&self) -> Vec<usize> {
         match &self.log_filter {
             None => (0..self.logs.len()).collect(),
@@ -250,7 +226,6 @@ impl App {
         }
     }
 
-    /// Uptime as a human-readable string.
     pub fn uptime_str(&self) -> String {
         let secs = self.start_time.elapsed().as_secs();
         let h = secs / 3600;

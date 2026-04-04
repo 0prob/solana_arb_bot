@@ -13,11 +13,15 @@ use crate::jupiter::{JupiterClient, QuoteResponse};
 use crate::jito::{JitoClient, build_tip_instruction};
 use crate::flash_loan;
 
+/// Maximum concurrent execution tasks.
+/// Kept at 2 for mobile: each task does 2 RPC calls + 2 Jupiter calls + 1 Jito call.
+const MOBILE_MAX_EXEC_CONCURRENCY: usize = 2;
+
 #[derive(Debug, Clone)]
 pub struct ArbOpportunity {
     pub loan_lamports: u64,
-    pub buy_quote: QuoteResponse,
-    pub sell_quote: QuoteResponse,
+    pub buy_quote: Arc<QuoteResponse>,
+    pub sell_quote: Arc<QuoteResponse>,
     pub slot: u64,
 }
 
@@ -26,12 +30,15 @@ pub async fn run(
     mut rx: mpsc::Receiver<ArbOpportunity>,
     cancel: CancellationToken,
 ) -> Result<()> {
-    let rpc = Arc::new(RpcClient::new(config.rpc_url.clone()));
+    // Shared RPC client — one connection pool for all executor tasks.
+    let rpc = Arc::new(RpcClient::new(config.rpc_url.to_string()));
     let jupiter = JupiterClient::new(&config.jupiter_api_url);
     let jito = JitoClient::new(&config.jito_block_engine_url);
-    let semaphore = Arc::new(Semaphore::new(config.scanner_max_concurrency)); // Reuse scanner concurrency for executor
-    
-    info!("Executor started");
+
+    let max_exec = config.scanner_max_concurrency.min(MOBILE_MAX_EXEC_CONCURRENCY);
+    let semaphore = Arc::new(Semaphore::new(max_exec));
+
+    info!(max_exec, "Executor started (mobile-optimized)");
 
     loop {
         let opp = tokio::select! {
@@ -42,7 +49,15 @@ pub async fn run(
             },
         };
 
-        let permit = semaphore.clone().acquire_owned().await?;
+        // Non-blocking permit: if executor is at capacity, drop the opportunity.
+        let permit = match semaphore.clone().try_acquire_owned() {
+            Ok(p) => p,
+            Err(_) => {
+                warn!("Executor at capacity, dropping opportunity");
+                continue;
+            }
+        };
+
         let cfg = config.clone();
         let r = rpc.clone();
         let jup = jupiter.clone();
@@ -58,6 +73,7 @@ pub async fn run(
     Ok(())
 }
 
+#[inline]
 async fn execute_opportunity(
     config: Arc<AppConfig>,
     rpc: Arc<RpcClient>,
@@ -65,16 +81,19 @@ async fn execute_opportunity(
     jito: JitoClient,
     opp: ArbOpportunity,
 ) -> Result<()> {
+    // ── Staleness check ───────────────────────────────────────────────────
     let current_slot = rpc.get_slot().await?;
     if current_slot > opp.slot + config.max_opportunity_age_slots {
-        warn!("Opportunity stale");
+        warn!("Opportunity stale, skipping");
         return Ok(());
     }
 
+    // ── Fetch swap instructions ───────────────────────────────────────────
     let buy_ixs = jupiter.swap_instructions(&config.fee_payer.pubkey(), &opp.buy_quote).await?;
     let sell_ixs = jupiter.swap_instructions(&config.fee_payer.pubkey(), &opp.sell_quote).await?;
 
-    let mut instructions = Vec::new();
+    // ── Build instruction list (pre-allocated with capacity) ─────────────
+    let mut instructions = Vec::with_capacity(16);
     let flash_loan = flash_loan::build_flash_loan_instructions(
         &config.fee_payer.pubkey(),
         opp.loan_lamports,
@@ -90,12 +109,13 @@ async fn execute_opportunity(
         for ix in setup { instructions.push(crate::jupiter::parse_ix(&ix)?); }
     }
     instructions.push(crate::jupiter::parse_ix(&sell_ixs.swap_instruction)?);
-    
+
     let profit = crate::jupiter::estimate_profit(opp.loan_lamports, &opp.sell_quote, 0, config.estimated_tx_cost())?;
     let tip = config.dynamic_jito_tip(profit as u64);
     instructions.push(build_tip_instruction(&config.fee_payer.pubkey(), tip)?);
     instructions.push(flash_loan.repay_ix);
 
+    // ── Compile and sign transaction ──────────────────────────────────────
     let recent_blockhash = rpc.get_latest_blockhash().await?;
     let message = solana_sdk::message::v0::Message::try_compile(
         &config.fee_payer.pubkey(),
@@ -103,15 +123,23 @@ async fn execute_opportunity(
         &[],
         recent_blockhash,
     )?;
-    let tx = VersionedTransaction::try_new(solana_sdk::message::VersionedMessage::V0(message), &[&config.fee_payer])?;
+    let tx = VersionedTransaction::try_new(
+        solana_sdk::message::VersionedMessage::V0(message),
+        &[&config.fee_payer],
+    )?;
 
-    // Simulation before sending
-    let sim_res = rpc.simulate_transaction(&tx).await?;
-    if let Some(err) = sim_res.value.err {
-        warn!(error = ?err, logs = ?sim_res.value.logs, "Simulation failed");
-        return Ok(());
+    // ── Simulation (skip in mobile mode to save 1 RPC round-trip) ────────
+    // Simulation is expensive: it deserializes full account state and runs
+    // the SVM. On mobile, we skip it and rely on Jito's bundle validation.
+    if !config.skip_simulation {
+        let sim_res = rpc.simulate_transaction(&tx).await?;
+        if let Some(err) = sim_res.value.err {
+            warn!(error = ?err, "Simulation failed");
+            return Ok(());
+        }
     }
 
+    // ── Submit to Jito ────────────────────────────────────────────────────
     let bundle_id = jito.send_bundle(&[tx]).await?;
     info!(
         bundle_id,

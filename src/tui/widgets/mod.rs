@@ -1,3 +1,4 @@
+#![cfg(feature = "tui")]
 pub mod header;
 pub mod logs_viewer;
 pub mod opportunities_table;

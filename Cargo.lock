@@ -3367,6 +3367,7 @@ name = "sb"
 version = "0.6.0"
 dependencies = [
  "anyhow",
+ "arrayvec",
  "base64 0.22.1",
  "bincode",
  "bs58",
@@ -3381,6 +3382,7 @@ dependencies = [
  "rustls",
  "serde",
  "serde_json",
+ "smallvec",
  "solana-address-lookup-table-interface",
  "solana-client",
  "solana-commitment-config",

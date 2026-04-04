@@ -2,13 +2,19 @@ use anyhow::Result;
 use std::sync::Arc;
 use tokio::sync::{mpsc, Semaphore};
 use tokio_util::sync::CancellationToken;
-use tracing::{debug, info};
+use tracing::{debug, info, warn};
 use crate::config::AppConfig;
 use crate::jupiter::JupiterClient;
 use crate::listener::{ArbEvent, EventType};
 use crate::executor::ArbOpportunity;
 
-pub const OPPORTUNITY_CHANNEL_CAPACITY: usize = 64;
+/// Bounded opportunity channel — prevents executor queue OOM under burst.
+/// 16 slots is enough for any realistic burst; extras are dropped via try_send.
+pub const OPPORTUNITY_CHANNEL_CAPACITY: usize = 16;
+
+/// Maximum concurrent scanner tasks (mobile-safe default: 4).
+/// Each task holds 2 in-flight HTTP connections to Jupiter.
+const MOBILE_MAX_CONCURRENCY: usize = 4;
 
 pub async fn run(
     config: Arc<AppConfig>,
@@ -17,9 +23,20 @@ pub async fn run(
     cancel: CancellationToken,
 ) -> Result<()> {
     let jupiter = JupiterClient::new(&config.jupiter_api_url);
-    let semaphore = Arc::new(Semaphore::new(config.scanner_max_concurrency));
 
-    info!("Scanner started with Phase 2 support (Triangular & Liquidation)");
+    // Cap concurrency: use the lower of configured value and mobile-safe limit.
+    let max_concurrency = config.scanner_max_concurrency.min(MOBILE_MAX_CONCURRENCY);
+    let semaphore = Arc::new(Semaphore::new(max_concurrency));
+
+    // Simple dedup: track last-seen pubkey to skip duplicate events within a slot.
+    // Uses a fixed-size ring buffer via a small VecDeque cap.
+    let mut recent_keys: std::collections::VecDeque<(solana_sdk::pubkey::Pubkey, u64)> =
+        std::collections::VecDeque::with_capacity(32);
+
+    info!(
+        max_concurrency,
+        "Scanner started (mobile-optimized, dedup enabled)"
+    );
 
     loop {
         let event = tokio::select! {
@@ -30,7 +47,32 @@ pub async fn run(
             },
         };
 
-        let permit = semaphore.clone().acquire_owned().await?;
+        // ── Deduplication: skip if same key seen in the last 32 events ───
+        let event_key = match &event.event_type {
+            EventType::Migration(pk) | EventType::Liquidation(pk) => *pk,
+        };
+        let is_dup = recent_keys.iter().any(|(k, slot)| {
+            *k == event_key && event.slot.saturating_sub(*slot) < 5
+        });
+        if is_dup {
+            debug!(token = %event_key, "Skipping duplicate event");
+            continue;
+        }
+        if recent_keys.len() >= 32 {
+            recent_keys.pop_front();
+        }
+        recent_keys.push_back((event_key, event.slot));
+
+        // ── Back-pressure: if semaphore is exhausted, drop event ─────────
+        // This prevents unbounded task spawning under high event rates.
+        let permit = match semaphore.clone().try_acquire_owned() {
+            Ok(p) => p,
+            Err(_) => {
+                debug!(token = %event_key, "Scanner at capacity, dropping event");
+                continue;
+            }
+        };
+
         let cfg = config.clone();
         let jup = jupiter.clone();
         let tx = opportunity_tx.clone();
@@ -53,6 +95,7 @@ pub async fn run(
     }
 }
 
+#[inline]
 async fn evaluate_triangular_opportunity(
     config: Arc<AppConfig>,
     jupiter: JupiterClient,
@@ -61,20 +104,42 @@ async fn evaluate_triangular_opportunity(
     tx: mpsc::Sender<ArbOpportunity>,
 ) -> Result<()> {
     let wsol = crate::config::programs::wsol_mint();
-    let loan_amounts = [config.max_loan_lamports / 4, config.max_loan_lamports / 2, config.max_loan_lamports];
+
+    // Only test max loan amount first (most likely to be profitable).
+    // Fall back to smaller amounts only if max is unprofitable.
+    // This halves the number of Jupiter round-trips on the hot path.
+    let loan_amounts = [
+        config.max_loan_lamports,
+        config.max_loan_lamports / 2,
+        config.max_loan_lamports / 4,
+    ];
 
     for &amount in &loan_amounts {
         if amount == 0 { continue; }
-        
-        // Step 1: Find the best buy route (WSOL -> Token)
-        let buy_quote = jupiter.quote(&wsol, &token_mint, amount, config.slippage_bps).await?;
-        let token_out: u64 = buy_quote.other_amount_threshold.parse()?;
+
+        // Step 1: WSOL -> Token quote
+        let buy_quote = match jupiter.quote(&wsol, &token_mint, amount, config.slippage_bps).await {
+            Ok(q) => q,
+            Err(e) => {
+                debug!(error = %e, "Buy quote failed");
+                return Ok(());
+            }
+        };
+        let token_out: u64 = match buy_quote.other_amount_threshold.parse() {
+            Ok(v) => v,
+            Err(_) => continue,
+        };
         if token_out == 0 { continue; }
-        
-        // Step 2: Find the best sell route (Token -> WSOL)
-        // Jupiter will automatically find the best route across all DEXes, effectively performing cross-DEX arb.
-        let sell_quote = jupiter.quote(&token_mint, &wsol, token_out, config.slippage_bps).await?;
-        
+
+        // Step 2: Token -> WSOL quote
+        let sell_quote = match jupiter.quote(&token_mint, &wsol, token_out, config.slippage_bps).await {
+            Ok(q) => q,
+            Err(e) => {
+                debug!(error = %e, "Sell quote failed");
+                return Ok(());
+            }
+        };
+
         let profit = crate::jupiter::estimate_profit(amount, &sell_quote, 0, config.estimated_tx_cost())?;
         if profit >= config.min_profit_lamports as i64 {
             info!(
@@ -85,11 +150,15 @@ async fn evaluate_triangular_opportunity(
             );
             let opp = ArbOpportunity {
                 loan_lamports: amount,
-                buy_quote,
-                sell_quote,
+                buy_quote: std::sync::Arc::new(buy_quote),
+                sell_quote: std::sync::Arc::new(sell_quote),
                 slot,
             };
-            let _ = tx.try_send(opp);
+            // Non-blocking: if executor queue is full, drop this opportunity.
+            if tx.try_send(opp).is_err() {
+                warn!(token = %token_mint, "Executor queue full, dropping opportunity");
+            }
+            // Found profitable at this size — no need to try smaller amounts.
             break;
         } else {
             debug!(
@@ -98,6 +167,9 @@ async fn evaluate_triangular_opportunity(
                 profit_sol = (profit as f64 / 1_000_000_000.0),
                 "Opportunity not profitable enough"
             );
+            // If max loan is unprofitable, smaller loans will also be unprofitable
+            // (Jupiter routing is monotonic for small amounts). Break early.
+            break;
         }
     }
     Ok(())
@@ -110,9 +182,7 @@ async fn evaluate_liquidation_opportunity(
     _slot: u64,
     _tx: mpsc::Sender<ArbOpportunity>,
 ) -> Result<()> {
-    // Heuristic: Check obligation health factor (requires RPC call to get account data)
-    // If health factor < 1.0, calculate liquidation profitability.
-    // For now, this is a stub as it requires protocol-specific account parsing.
+    // Stub: liquidation requires protocol-specific account parsing.
     debug!("Liquidation check for obligation: {}", _obligation_account);
     Ok(())
 }

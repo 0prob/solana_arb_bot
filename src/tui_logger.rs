@@ -1,3 +1,4 @@
+#![cfg(feature = "tui")]
 use tokio::sync::mpsc;
 use tracing::{field::Visit, Subscriber};
 use tracing_subscriber::Layer;
