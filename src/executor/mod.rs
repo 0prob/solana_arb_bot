@@ -110,7 +110,7 @@ async fn execute_opportunity(
     }
     instructions.push(crate::jupiter::parse_ix(&sell_ixs.swap_instruction)?);
 
-    let profit = crate::jupiter::estimate_profit(opp.loan_lamports, &opp.sell_quote, 0, config.estimated_tx_cost())?;
+    let profit = crate::jupiter::estimate_profit(opp.loan_lamports, &opp.sell_quote, config.slippage_bps, config.estimated_tx_cost())?;
     let tip = config.dynamic_jito_tip(profit as u64);
     instructions.push(build_tip_instruction(&config.fee_payer.pubkey(), tip)?);
     instructions.push(flash_loan.repay_ix);

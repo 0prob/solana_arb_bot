@@ -153,9 +153,11 @@ fn b64_deserialize(s: &str) -> Result<Vec<u8>> {
 pub fn estimate_profit(
     loan_amount: u64,
     sell_quote: &QuoteResponse,
-    _fee_bps: u16,
+    fee_bps: u16,
     tx_cost: u64,
 ) -> Result<i64> {
     let out_amount: u64 = sell_quote.other_amount_threshold.parse()?;
-    Ok(out_amount as i64 - loan_amount as i64 - tx_cost as i64)
+    let fee_adjustment = (out_amount as u128 * fee_bps as u128 / 10000) as u64;
+    let net_out = out_amount.saturating_sub(fee_adjustment);
+    Ok(net_out as i64 - loan_amount as i64 - tx_cost as i64)
 }

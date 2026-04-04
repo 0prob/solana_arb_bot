@@ -140,7 +140,7 @@ async fn evaluate_triangular_opportunity(
             }
         };
 
-        let profit = crate::jupiter::estimate_profit(amount, &sell_quote, 0, config.estimated_tx_cost())?;
+        let profit = crate::jupiter::estimate_profit(amount, &sell_quote, config.slippage_bps, config.estimated_tx_cost())?;
         if profit >= config.min_profit_lamports as i64 {
             info!(
                 token = %token_mint,

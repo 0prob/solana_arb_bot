@@ -84,9 +84,9 @@ impl JitoClient {
             return Err(anyhow::anyhow!("Jito error: {err}"));
         }
 
-        Ok(resp["result"]
-            .as_str()
-            .unwrap_or("unknown")
-            .to_string())
+        let result = resp.get("result")
+            .and_then(|r| r.as_str())
+            .ok_or_else(|| anyhow::anyhow!("Jito response missing 'result' field"))?;
+        Ok(result.to_string())
     }
 }

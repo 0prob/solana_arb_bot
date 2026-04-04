@@ -52,7 +52,7 @@ pub mod programs {
             vec![
                 Pubkey::from_str("So1endDq2Ykq6EB8WnAn8W7THCWYFTFvXrqcnS8tMvS").unwrap(), // Solend
                 Pubkey::from_str("KLend2g3cPEPihL362shW35otGoSS6V3fM6fHjr45qG").unwrap(), // Kamino
-                Pubkey::from_str("MFv2hWf31Z9kb3u7MqcPySxd9Y6S9Xj6Y9Y9Y9Y9Y9Y").unwrap(), // Marginfi (Placeholder)
+                Pubkey::from_str("MFi7Gk7uXp89H9E9G89G89G89G89G89G89G89G89G89").unwrap(), // Marginfi Placeholder (example valid format)
             ]
         }).clone()
     }
