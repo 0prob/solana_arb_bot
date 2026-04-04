@@ -42,7 +42,7 @@ async fn main() -> Result<()> {
     let _ = dotenvy::dotenv();
 
     let args = CliArgs::parse();
-    let no_tui = args.no_tui;
+    let no_tui = args._no_tui;
 
     // When running headless (CI, Docker, systemd) or --no-tui is passed,
     // initialize structured tracing to stderr instead of the TUI.

@@ -194,6 +194,7 @@ pub fn collect_alt_addresses(
     Ok(alts)
 }
 
+#[allow(dead_code)]
 pub fn parse_out_amount(quote: &QuoteResponse) -> Result<u64> {
     quote
         .out_amount
@@ -310,7 +311,7 @@ pub struct SwapInfo {
 #[serde(rename_all = "camelCase")]
 pub struct SwapInstructionsResponse {
     pub token_ledger_instruction: Option<InstructionData>,
-    pub compute_budget_instructions: Option<Vec<InstructionData>>,
+    pub _compute_budget_instructions: Option<Vec<InstructionData>>,
     pub setup_instructions: Option<Vec<InstructionData>>,
     pub swap_instruction: InstructionData,
     pub cleanup_instruction: Option<InstructionData>,

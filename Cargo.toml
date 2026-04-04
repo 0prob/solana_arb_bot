@@ -1,7 +1,10 @@
 [package]
 name = "sb"
-version = "0.4.0"
+version = "0.5.0"
 edition = "2021"
+description = "Zero-capital Solana flash-loan arbitrage bot"
+authors = ["0prob"]
+license = "MIT"
 
 [dependencies]
 # ── Solana ────────────────────────────────────────────────────────────
@@ -59,6 +62,11 @@ rand = "0.10"
 ratatui = "0.30"
 crossterm = "0.29"
 
+# ── Release profile — optimised for latency-critical HFT ─────────────
+# opt-level 3 + thin-LTO + single codegen unit gives the best
+# inlining and dead-code elimination without the full-LTO link cost.
+# panic=abort removes the unwinding machinery (~10 % binary size).
+# strip=true removes debug symbols from the final binary.
 [profile.release]
 opt-level = 3
 lto = "thin"
@@ -66,5 +74,8 @@ strip = true
 codegen-units = 1
 panic = "abort"
 
+# ── Dev profile — faster incremental builds during development ────────
+# opt-level 1 gives enough optimisation to make async/await readable in
+# backtraces while keeping compile times short.
 [profile.dev]
 opt-level = 1

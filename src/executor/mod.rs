@@ -49,14 +49,13 @@ use crate::tui::{DashEvent, DashHandle};
 #[derive(Debug, Clone)]
 pub struct ArbOpportunity {
     pub token_mint: Pubkey,
-    pub pool_address: Option<Pubkey>,
-    pub dex_label: String,
+    pub _pool_address: Option<Pubkey>,
     pub loan_amount_lamports: u64,
     pub expected_profit_lamports: u64,
-    pub buy_quote: QuoteResponse,
-    pub sell_quote: QuoteResponse,
+    pub _buy_quote: QuoteResponse,
+    pub _sell_quote: QuoteResponse,
     pub detected_slot: u64,
-    pub source_signature: String,
+    pub _source_signature: String,
 }
 
 struct ExecutionOutcome {
@@ -171,7 +170,7 @@ pub async fn run(
 
         info!(
             token = %opp.token_mint,
-            dex   = %opp.dex_label,
+
             profit_sol = opp.expected_profit_lamports as f64 / 1e9,
             loan_sol   = opp.loan_amount_lamports as f64 / 1e9,
             "Executing arb"
@@ -220,8 +219,8 @@ pub async fn run(
                     token:      token_str,
                     signature:  outcome.signature.clone(),
                     profit_sol: net as f64 / 1e9,
-                    tip_sol:    tip as f64 / 1e9,
-                    fee_sol:    actual_priority_fee_lamports as f64 / 1e9,
+                    _tip_sol:    tip as f64 / 1e9,
+                    _fee_sol:    actual_priority_fee_lamports as f64 / 1e9,
                     via_jito:   outcome.via_jito,
                 });
             }
@@ -255,6 +254,7 @@ pub async fn run(
     }
 }
 
+#[allow(clippy::too_many_arguments)]
 async fn execute_arb(
     config: &AppConfig,
     rpc: &RpcClient,
@@ -297,9 +297,17 @@ async fn execute_arb(
         .await
         .context("Fresh buy quote failed")?;
 
-    let token_amount = jupiter::parse_out_amount(&fresh_buy)?;
+    // CRITICAL FIX: Use `other_amount_threshold` (worst-case output) as the input
+    // for the sell quote. If we use the optimistic `out_amount`, the sell swap
+    // instruction will hardcode an `inAmount` we might not actually receive after
+    // buy slippage, causing the transaction to fail with insufficient funds.
+    let token_amount = fresh_buy
+        .other_amount_threshold
+        .parse::<u64>()
+        .context("Failed to parse other_amount_threshold from fresh buy quote")?;
+
     if token_amount == 0 {
-        anyhow::bail!("Fresh buy quote returned 0 tokens");
+        anyhow::bail!("Fresh buy quote returned 0 tokens (after slippage)");
     }
 
     let fresh_sell = jupiter
@@ -575,6 +583,7 @@ async fn simulate_transaction(rpc: &RpcClient, tx: &VersionedTransaction) -> Res
     Ok(())
 }
 
+#[allow(clippy::too_many_arguments)]
 fn build_instruction_plan(
     config: &AppConfig,
     payer: &Pubkey,
@@ -665,7 +674,7 @@ fn parse_alt_account(key: Pubkey, data: &[u8]) -> Result<AddressLookupTableAccou
     }
 
     let addresses_data = &data[ALT_HEADER_LEN..];
-    if addresses_data.len() % 32 != 0 {
+    if !addresses_data.len().is_multiple_of(32) {
         anyhow::bail!("ALT addresses invalid length ({} bytes)", addresses_data.len());
     }
 

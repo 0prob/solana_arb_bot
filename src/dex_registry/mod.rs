@@ -81,6 +81,7 @@ pub fn detectable_dexes() -> &'static [DexEntry] {
 
 /// Look up a DEX label by program ID (used to classify Jupiter route legs).
 /// O(n) scan over the static slice — no allocation.
+#[allow(dead_code)]
 pub fn label_for_program(program_id: &Pubkey) -> Option<&'static str> {
     all_dexes()
         .iter()

@@ -65,6 +65,7 @@ impl TatumGrpcConfig {
 
     /// Convenience constructor that uses the canonical Tatum Solana mainnet
     /// endpoint and only requires the API key.
+    #[allow(dead_code)]
     pub fn mainnet(api_key: impl Into<String>) -> Result<Self> {
         Self::new(TATUM_SOLANA_GRPC_ENDPOINT, api_key)
     }

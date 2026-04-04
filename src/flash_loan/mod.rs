@@ -407,7 +407,7 @@ fn build_save(borrower: &Pubkey, amount_lamports: u64) -> Result<FlashLoanInstru
 /// Ceiling division: computes ⌈amount × bps / 10_000⌉
 fn fee_ceil(amount: u64, bps: u16) -> u64 {
     let n = amount as u128 * bps as u128;
-    ((n + 9_999) / 10_000) as u64
+    n.div_ceil(10_000) as u64
 }
 
 fn associated_token_account(wallet: &Pubkey, mint: &Pubkey) -> Result<Pubkey> {

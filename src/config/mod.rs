@@ -155,7 +155,7 @@ pub struct CliArgs {
     pub jito_enabled: bool,
 
     #[arg(long, env = "JITO_BLOCK_ENGINE_URL", default_value = "https://mainnet.block-engine.jito.wtf")]
-    pub jito_block_engine_url: String,
+    pub _jito_block_engine_url: String,
 
     /// Floor tip in lamports — used when dynamic tip is zero (very small profits).
     #[arg(long, env = "JITO_TIP_FLOOR_LAMPORTS", default_value = "10000")]
@@ -186,7 +186,7 @@ pub struct CliArgs {
     /// Disable the ratatui TUI. When set, structured logs are written to stderr.
     /// Useful for CI, Docker, or systemd deployments without a TTY.
     #[arg(long, env = "NO_TUI", default_value = "false")]
-    pub no_tui: bool,
+    pub _no_tui: bool,
 
     // ── Tatum gRPC provider ──────────────────────────────────────────────
     //
@@ -239,7 +239,7 @@ pub struct AppConfig {
     pub max_tx_retries: u8,
     pub scanner_max_concurrency: usize,
     pub jito_enabled: bool,
-    pub jito_block_engine_url: String,
+    pub _jito_block_engine_url: String,
     /// Floor tip — minimum even for tiny-profit arbs.
     pub jito_tip_floor_lamports: u64,
     /// Ceiling tip — hard cap.
@@ -250,7 +250,7 @@ pub struct AppConfig {
     pub min_balance_lamports: u64,
     /// Drop opportunities older than this many slots without making any RPC calls.
     pub max_opportunity_age_slots: u64,
-    pub no_tui: bool,
+    pub _no_tui: bool,
 
     // ── Tatum gRPC provider ──────────────────────────────────────────────
     /// Tatum API key.  Non-empty when the Tatum provider is active.
@@ -296,13 +296,13 @@ impl AppConfig {
             max_tx_retries:        args.max_tx_retries,
             scanner_max_concurrency: args.scanner_max_concurrency,
             jito_enabled:          args.jito_enabled,
-            jito_block_engine_url: args.jito_block_engine_url.trim_end_matches('/').to_string(),
+            _jito_block_engine_url: args._jito_block_engine_url.trim_end_matches('/').to_string(),
             jito_tip_floor_lamports:   args.jito_tip_floor_lamports,
             jito_tip_max_lamports:     args.jito_tip_max_lamports,
             jito_tip_profit_fraction:  args.jito_tip_profit_fraction.clamp(0.0, 1.0),
             min_balance_lamports:  args.min_balance_lamports,
             max_opportunity_age_slots: args.max_opportunity_age_slots,
-            no_tui:                args.no_tui,
+            _no_tui:                args._no_tui,
             tatum_api_key:         args.tatum_api_key,
             tatum_grpc_endpoint:   args.tatum_grpc_endpoint.trim_end_matches('/').to_string(),
         })

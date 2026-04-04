@@ -85,6 +85,7 @@ pub async fn run(
     }
 }
 
+#[allow(clippy::too_many_arguments)]
 async fn process_event(
     cfg: Arc<AppConfig>,
     jup: JupiterClient,
@@ -99,7 +100,7 @@ async fn process_event(
 
     // Allocate token string once — reused in all DashEvent sends below.
     let token_str = event.token_mint.to_string();
-    dash.send(DashEvent::ScannerEvaluating { token: token_str.clone() });
+    dash.send(DashEvent::ScannerEvaluating { _token: token_str.clone() });
 
     let result = tokio::time::timeout(
         std::time::Duration::from_millis(EVAL_TIMEOUT_MS),
@@ -120,7 +121,7 @@ async fn process_event(
         }
         Ok(Ok(None)) => {
             debug!(token = %event.token_mint, "No profitable route");
-            dash.send(DashEvent::ScannerUnprofitable { token: token_str });
+            dash.send(DashEvent::ScannerUnprofitable { _token: token_str });
         }
         Ok(Err(e)) => {
             warn!(token = %event.token_mint, error = %e, "Evaluation error");
@@ -184,7 +185,11 @@ async fn evaluate_opportunity(
             break;
         }
 
-        let token_amount = match jupiter::parse_out_amount(&buy_quote) {
+        // CRITICAL FIX: Use `other_amount_threshold` (worst-case output) as the input
+        // for the sell quote. If we use the optimistic `out_amount`, the sell swap
+        // instruction will hardcode an `inAmount` we might not actually receive after
+        // buy slippage, causing the transaction to fail with insufficient funds.
+        let token_amount = match buy_quote.other_amount_threshold.parse::<u64>() {
             Ok(a) if a > 0 => a,
             _ => continue,
         };
@@ -238,14 +243,13 @@ async fn evaluate_opportunity(
             best_profit = profit;
             best = Some(ArbOpportunity {
                 token_mint: *token_mint,
-                pool_address: event.pool_address,
-                dex_label: event.dex_label.clone(),
+                _pool_address: event.pool_address,
                 loan_amount_lamports: loan_lamports,
                 expected_profit_lamports: profit as u64,
-                buy_quote: buy_quote.clone(),
-                sell_quote: sell_quote.clone(),
+                _buy_quote: buy_quote.clone(),
+                _sell_quote: sell_quote.clone(),
                 detected_slot: event.slot,
-                source_signature: event.signature.clone(),
+                _source_signature: event.signature.clone(),
             });
         }
     }

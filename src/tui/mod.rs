@@ -45,9 +45,9 @@ pub enum DashEvent {
     PoolDetected         { token: String, dex: String, slot: u64 },
 
     // Scanner
-    ScannerEvaluating  { token: String },
+    ScannerEvaluating  { _token: String },
     ScannerProfitable  { token: String, loan_sol: f64, profit_sol: f64 },
-    ScannerUnprofitable { token: String },
+    ScannerUnprofitable { _token: String },
     ScannerTimeout     { token: String },
     ScannerError       { token: String, msg: String },
 
@@ -57,8 +57,8 @@ pub enum DashEvent {
         token:      String,
         signature:  String,
         profit_sol: f64,
-        tip_sol:    f64,
-        fee_sol:    f64,
+        _tip_sol:    f64,
+        _fee_sol:    f64,
         via_jito:   bool,
     },
     ExecutorFailed      { token: String, reason: String },
@@ -204,7 +204,7 @@ impl DashState {
                 self.push_log(LogLevel::Info, "EXECUTOR",
                     format!("Submitting  {} loan={:.2} SOL", shorten(&token, 12), loan_sol));
             }
-            DashEvent::ExecutorConfirmed { token, signature, profit_sol, tip_sol: _, fee_sol: _, via_jito } => {
+            DashEvent::ExecutorConfirmed { token, signature, profit_sol, _tip_sol: _, _fee_sol: _, via_jito } => {
                 // NOTE: do NOT accumulate net_profit_sol here.
                 // MetricsTick carries the authoritative value from atomic counters.
                 // Accumulating here AND in MetricsTick would double-count every trade.

@@ -78,6 +78,7 @@ pub struct MigrationEvent {
 
 /// Coarser classification used by executor/scanner for protocol-specific logic.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[allow(dead_code)]
 pub enum DexTarget {
     PumpSwap,
     RaydiumV4,
@@ -85,6 +86,7 @@ pub enum DexTarget {
 }
 
 impl MigrationEvent {
+    #[allow(dead_code)]
     pub fn dex_target(&self) -> DexTarget {
         match self.dex_label.as_str() {
             "PumpSwap"   => DexTarget::PumpSwap,
