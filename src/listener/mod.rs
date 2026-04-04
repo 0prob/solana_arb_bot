@@ -32,6 +32,9 @@ pub async fn run(
 ) -> Result<()> {
     let mut client = GeyserGrpcClient::build_from_shared(config.grpc_endpoint.clone())?
         .x_token(Some(&config.grpc_x_token))?
+        .tls_config(tonic::transport::ClientTlsConfig::new().with_native_roots())?
+        .connect_timeout(std::time::Duration::from_secs(10))
+        .timeout(std::time::Duration::from_secs(10))
         .connect()
         .await?;
 
@@ -78,8 +81,8 @@ pub async fn run(
     }
 
     let request = SubscribeRequest {
-        transactions,
-        accounts,
+        transactions: transactions.clone(),
+        accounts: accounts.clone(),
         ..Default::default()
     };
 
@@ -93,10 +96,64 @@ pub async fn run(
                 let update = match update {
                     Some(Ok(u)) => u,
                     Some(Err(e)) => {
-                        warn!(error = %e, "gRPC stream error");
-                        continue;
+                        warn!(error = %e, "gRPC stream error, attempting to reconnect...");
+                        // Reconnection logic
+                        tokio::time::sleep(std::time::Duration::from_secs(1)).await;
+                        match GeyserGrpcClient::build_from_shared(config.grpc_endpoint.clone())?
+                            .x_token(Some(&config.grpc_x_token))?
+                            .tls_config(tonic::transport::ClientTlsConfig::new().with_native_roots())?
+                            .connect()
+                            .await 
+                        {
+                            Ok(new_client) => {
+                                client = new_client;
+                                let request = SubscribeRequest {
+                                    transactions: transactions.clone(),
+                                    accounts: accounts.clone(),
+                                    ..Default::default()
+                                };
+                                match client.subscribe_with_request(Some(request)).await {
+                                    Ok((_, new_stream)) => {
+                                        stream = new_stream;
+                                        info!("Successfully reconnected to gRPC");
+                                        continue;
+                                    }
+                                    Err(re_err) => {
+                                        warn!(error = %re_err, "Failed to resubscribe after reconnection");
+                                        continue;
+                                    }
+                                }
+                            }
+                            Err(conn_err) => {
+                                warn!(error = %conn_err, "Failed to reconnect to gRPC");
+                                continue;
+                            }
+                        }
                     }
-                    None => break,
+                    None => {
+                        warn!("gRPC stream ended, attempting to reconnect...");
+                        tokio::time::sleep(std::time::Duration::from_secs(1)).await;
+                        // Similar reconnection logic for stream end
+                        if let Ok(new_client) = GeyserGrpcClient::build_from_shared(config.grpc_endpoint.clone())?
+                            .x_token(Some(&config.grpc_x_token))?
+                            .tls_config(tonic::transport::ClientTlsConfig::new().with_native_roots())?
+                            .connect()
+                            .await 
+                        {
+                            client = new_client;
+                            let request = SubscribeRequest {
+                                transactions: transactions.clone(),
+                                accounts: accounts.clone(),
+                                ..Default::default()
+                            };
+                            if let Ok((_, new_stream)) = client.subscribe_with_request(Some(request)).await {
+                                stream = new_stream;
+                                info!("Successfully reconnected to gRPC after stream end");
+                                continue;
+                            }
+                        }
+                        break;
+                    }
                 };
 
                 match update.update_oneof {
