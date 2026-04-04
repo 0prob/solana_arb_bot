@@ -3377,6 +3377,7 @@ dependencies = [
  "rand 0.10.0",
  "ratatui",
  "reqwest 0.13.2",
+ "rustls",
  "serde",
  "serde_json",
  "solana-address-lookup-table-interface",

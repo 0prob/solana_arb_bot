@@ -8,6 +8,7 @@ mod listener;
 mod safety;
 mod scanner;
 mod tui;
+mod tui_logger;
 
 use anyhow::Result;
 use clap::Parser;
@@ -21,13 +22,23 @@ use config::{AppConfig, CliArgs};
 async fn main() -> Result<()> {
     let _ = dotenvy::dotenv();
     let args = CliArgs::parse();
+
+    // Initialize default crypto provider for rustls
+    rustls::crypto::ring::default_provider()
+        .install_default()
+        .expect("Failed to install rustls crypto provider");
     
     // Initialize TUI state and channel
     let (_tui_tx, tui_rx) = mpsc::channel(100);
     let tui_state = Arc::new(std::sync::Mutex::new(tui::TuiState::new()));
 
-    // Standard tracing initialization
-    tracing_subscriber::fmt::init();
+    // Custom tracing initialization with TUI layer
+    use tracing_subscriber::prelude::*;
+    let tui_layer = tui_logger::TuiLoggerLayer::new(_tui_tx.clone(), tui_state.clone());
+    tracing_subscriber::registry()
+        .with(tracing_subscriber::fmt::layer())
+        .with(tui_layer)
+        .init();
 
     let config = Arc::new(AppConfig::from_cli(args)?);
     let cancel = CancellationToken::new();
