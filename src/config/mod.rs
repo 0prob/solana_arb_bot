@@ -46,11 +46,23 @@ pub mod programs {
         })
     }
 
+    pub fn lending_programs() -> Vec<Pubkey> {
+        static LENDING: OnceLock<Vec<Pubkey>> = OnceLock::new();
+        LENDING.get_or_init(|| {
+            vec![
+                Pubkey::from_str("So1endDq2Ykq6EB8WnAn8W7THCWYFTFvXrqcnS8tMvS").unwrap(), // Solend
+                Pubkey::from_str("KLend2g3cPEPihL362shW35otGoSS6V3fM6fHjr45qG").unwrap(), // Kamino
+                Pubkey::from_str("MFv2hWf31Z9kb3u7MqcPySxd9Y6S9Xj6Y9Y9Y9Y9Y9Y").unwrap(), // Marginfi (Placeholder)
+            ]
+        }).clone()
+    }
+
     pub fn validate_constants() {
         let _ = wsol_mint();
         let _ = ata_program();
         let _ = token_program();
         let _ = jito_tip_accounts();
+        let _ = lending_programs();
     }
 }
 

@@ -14,14 +14,20 @@ use crate::config::AppConfig;
 pub const MIGRATION_CHANNEL_CAPACITY: usize = 512;
 
 #[derive(Debug, Clone)]
-pub struct MigrationEvent {
-    pub token_mint: Pubkey,
+pub enum EventType {
+    Migration(Pubkey),
+    Liquidation(Pubkey), // Pubkey of the obligation account
+}
+
+#[derive(Debug, Clone)]
+pub struct ArbEvent {
+    pub event_type: EventType,
     pub slot: u64,
 }
 
 pub async fn run(
     config: Arc<AppConfig>,
-    tx: mpsc::Sender<MigrationEvent>,
+    tx: mpsc::Sender<ArbEvent>,
     cancel: CancellationToken,
 ) -> Result<()> {
     let mut client = GeyserGrpcClient::build_from_shared(config.grpc_endpoint.clone())?
@@ -43,12 +49,25 @@ pub async fn run(
     );
 
     let mut accounts = std::collections::HashMap::new();
-    // Subscribe to all detectable DEX program accounts to catch price updates/new pools
     let dex_map = crate::dex_registry::detectable_dex_map();
     for entry in dex_map.iter() {
         let program_id = entry.key();
         accounts.insert(
             format!("dex_{}", program_id),
+            SubscribeRequestFilterAccounts {
+                account: vec![],
+                owner: vec![program_id.to_string()],
+                filters: vec![],
+                nonempty_txn_signature: None,
+            },
+        );
+    }
+
+    // Subscribe to lending protocols for liquidations
+    let lending_programs = crate::config::programs::lending_programs();
+    for program_id in lending_programs {
+        accounts.insert(
+            format!("lending_{}", program_id),
             SubscribeRequestFilterAccounts {
                 account: vec![],
                 owner: vec![program_id.to_string()],
@@ -65,7 +84,7 @@ pub async fn run(
     };
 
     let (_, mut stream) = client.subscribe_with_request(Some(request)).await?;
-    info!("Listener connected to gRPC with transaction and account filters");
+    info!("Listener connected to gRPC with transaction, account, and lending filters");
 
     loop {
         tokio::select! {
@@ -85,7 +104,7 @@ pub async fn run(
                         process_transaction(&tx_update, &tx, &dex_map).await?;
                     }
                     Some(yellowstone_grpc_proto::geyser::subscribe_update::UpdateOneof::Account(acc_update)) => {
-                        process_account_update(&acc_update, &tx).await?;
+                        process_account_update(&acc_update, &tx, &dex_map).await?;
                     }
                     _ => {}
                 }
@@ -97,7 +116,7 @@ pub async fn run(
 
 async fn process_transaction(
     tx_update: &yellowstone_grpc_proto::geyser::SubscribeUpdateTransaction,
-    tx: &mpsc::Sender<MigrationEvent>,
+    tx: &mpsc::Sender<ArbEvent>,
     dex_map: &dashmap::DashMap<Pubkey, &'static str>,
 ) -> Result<()> {
     let transaction = tx_update.transaction.as_ref().context("Missing transaction")?;
@@ -112,8 +131,8 @@ async fn process_transaction(
                 let pk = account_keys.get(idx as usize).context("Invalid account index")?;
                 if pk != program_id && *pk != wsol {
                     debug!(token = %pk, "Pool detected via transaction");
-                    let _ = tx.try_send(MigrationEvent {
-                        token_mint: *pk,
+                    let _ = tx.try_send(ArbEvent {
+                        event_type: EventType::Migration(*pk),
                         slot: tx_update.slot,
                     });
                     break;
@@ -126,15 +145,26 @@ async fn process_transaction(
 
 async fn process_account_update(
     acc_update: &yellowstone_grpc_proto::geyser::SubscribeUpdateAccount,
-    tx: &mpsc::Sender<MigrationEvent>,
+    tx: &mpsc::Sender<ArbEvent>,
+    dex_map: &dashmap::DashMap<Pubkey, &'static str>,
 ) -> Result<()> {
     if let Some(account) = &acc_update.account {
         let pk = Pubkey::try_from(account.pubkey.as_slice()).context("Invalid pubkey")?;
-        debug!(account = %pk, "Account update detected, triggering scan");
-        let _ = tx.try_send(MigrationEvent {
-            token_mint: pk,
-            slot: acc_update.slot,
-        });
+        let owner = Pubkey::try_from(account.owner.as_slice()).context("Invalid owner")?;
+        
+        if dex_map.contains_key(&owner) {
+            debug!(account = %pk, "DEX account update detected, triggering scan");
+            let _ = tx.try_send(ArbEvent {
+                event_type: EventType::Migration(pk),
+                slot: acc_update.slot,
+            });
+        } else if crate::config::programs::lending_programs().contains(&owner) {
+            debug!(account = %pk, "Lending account update detected, triggering liquidation check");
+            let _ = tx.try_send(ArbEvent {
+                event_type: EventType::Liquidation(pk),
+                slot: acc_update.slot,
+            });
+        }
     }
     Ok(())
 }
