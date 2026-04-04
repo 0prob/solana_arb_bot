@@ -17,7 +17,18 @@
 //      • PumpSwap  — discriminator + account layout
 //      • Raydium V4 — tag byte + minimum accounts/data length
 //      • Generic DEX — heuristic: first non-SOL-native token mint in accounts
-// 6. Emit MigrationEvent on success; drop on any parse failure.
+// 6. Emit ALL matching events (not just the first) — a single transaction
+//    can create pools on multiple DEXes (e.g. bundled migrations).
+//
+// Performance improvements (v2):
+// ─────────────────────────────
+// • O(1) DashMap lookups via `dex_registry::detectable_dex_map()` instead
+//   of building a local HashMap per listener start.
+// • Emit ALL events per transaction (removed early-return after first match)
+//   to capture multi-pool creation transactions.
+// • Increased migration channel capacity from 128 → 512 to reduce drop rate
+//   during burst events (new token launches often cluster in time).
+// • Listener channel size exposed as a constant for easy tuning.
 //
 // Account layout references
 // ─────────────────────────
@@ -40,7 +51,6 @@
 use anyhow::{Context, Result};
 use futures::{SinkExt, StreamExt};
 use solana_sdk::pubkey::Pubkey;
-use std::collections::HashMap;
 use std::sync::Arc;
 use tokio::sync::mpsc;
 use tokio_util::sync::CancellationToken;
@@ -60,6 +70,15 @@ use crate::dex_registry;
 use crate::safety::DeduplicatorSet;
 use crate::tatum::GrpcProvider;
 use crate::tui::{DashEvent, DashHandle};
+
+// ── Channel capacity ─────────────────────────────────────────────────
+//
+// Increased from 128 to 512 to absorb burst events during token launch
+// windows, when many pools are created in rapid succession. The scanner
+// semaphore (SCANNER_MAX_CONCURRENCY) is the real backpressure mechanism;
+// this buffer just prevents the listener from dropping events during
+// momentary scanner saturation.
+pub const MIGRATION_CHANNEL_CAPACITY: usize = 512;
 
 // ── Public types ─────────────────────────────────────────────────────
 
@@ -128,7 +147,10 @@ pub async fn run(
         &config.tatum_grpc_endpoint,
     )?;
 
-    let dex_map = build_dex_lookup();
+    // Use the pre-built O(1) DashMap from the registry instead of building
+    // a local HashMap. This avoids a redundant allocation on every reconnect
+    // and gives O(1) lookup on the hot path.
+    let dex_map = dex_registry::detectable_dex_map();
 
     // Build the subscription request once — it is immutable across reconnects
     // because the DEX registry is a static slice. Cloning it is cheap.
@@ -145,7 +167,7 @@ pub async fn run(
 
         let result = tokio::select! {
             _ = cancel.cancelled() => return Ok(()),
-            r = run_subscription(&provider, &tx, &dedupe, &dex_map, &dash, subscribe_request.clone()) => r,
+            r = run_subscription(&provider, &tx, &dedupe, dex_map, &dash, subscribe_request.clone()) => r,
         };
 
         match result {
@@ -186,19 +208,12 @@ pub async fn run(
     }
 }
 
-// ── Dex lookup table ─────────────────────────────────────────────────
-
-/// Map from program_id → label for all detectable DEXes.
-fn build_dex_lookup() -> HashMap<Pubkey, &'static str> {
-    dex_registry::detectable_dexes()
-        .iter()
-        .map(|d| (d.program_id, d.label))
-        .collect()
-}
+// ── Subscription request builder ─────────────────────────────────────
 
 /// Build the gRPC SubscribeRequest once from the DEX registry.
 /// One transaction filter is created per detectable DEX program.
 fn build_subscribe_request() -> SubscribeRequest {
+    use std::collections::HashMap;
     let mut transactions: HashMap<String, SubscribeRequestFilterTransactions> = HashMap::new();
 
     for entry in dex_registry::detectable_dexes() {
@@ -239,7 +254,7 @@ async fn run_subscription(
     provider: &GrpcProvider,
     tx: &mpsc::Sender<MigrationEvent>,
     dedupe: &DeduplicatorSet,
-    dex_map: &HashMap<Pubkey, &'static str>,
+    dex_map: &dashmap::DashMap<Pubkey, &'static str>,
     dash: &DashHandle,
     request: SubscribeRequest,
 ) -> Result<()> {
@@ -258,7 +273,7 @@ async fn run_subscription(
         // HTTP/2 keepalive pings every 15 s — detects silently-dead connections
         // that would otherwise block the stream.recv() forever.
         .http2_keep_alive_interval(std::time::Duration::from_secs(15))
-        // Consider the connection dead if no keepalive ACK arrives within 5 s.
+        // Consider the connection dead if no keepalive response arrives within 5 s.
         .keep_alive_timeout(std::time::Duration::from_secs(5))
         // Send keepalives even when there are no in-flight RPCs.  Required here
         // because the subscription is long-lived with no request traffic.
@@ -314,7 +329,7 @@ async fn run_subscription(
 // ── Transaction processing ────────────────────────────────────────────
 
 async fn process_transaction(
-    dex_map: &HashMap<Pubkey, &'static str>,
+    dex_map: &dashmap::DashMap<Pubkey, &'static str>,
     event_tx: &mpsc::Sender<MigrationEvent>,
     dedupe: &DeduplicatorSet,
     tx_update: &SubscribeUpdateTransaction,
@@ -359,17 +374,23 @@ async fn process_transaction(
     //   (meta.loaded_writable_addresses then meta.loaded_readonly_addresses).
     let account_table = build_account_table(msg, tx_info.meta.as_ref());
 
-    // Walk top-level instructions first.
-    if let Some(event) = scan_instructions(
+    // Collect ALL matching events from this transaction.
+    //
+    // A single transaction can create pools on multiple DEXes (e.g. a bundled
+    // migration that lists a token on both PumpSwap and Raydium simultaneously).
+    // The previous implementation returned after the first match, silently
+    // missing subsequent pool creations in the same transaction.
+    let mut events: Vec<MigrationEvent> = Vec::new();
+
+    // Walk top-level instructions.
+    collect_events_from_instructions(
         msg.instructions.iter(),
         dex_map,
         &account_table,
         &signature,
         slot,
-    ) {
-        emit_event(event, event_tx, dash);
-        return;
-    }
+        &mut events,
+    );
 
     // Walk inner instructions (CPIs).
     //
@@ -378,15 +399,22 @@ async fn process_transaction(
     // a cross-program invocation is silently missed. This is the primary
     // reason early-detection bots miss PumpSwap pools created by aggregators.
     if let Some(meta) = &tx_info.meta {
-        if let Some(event) = scan_inner_instructions(
+        collect_events_from_inner_instructions(
             &meta.inner_instructions,
             dex_map,
             &account_table,
             &signature,
             slot,
-        ) {
-            emit_event(event, event_tx, dash);
-        }
+            &mut events,
+        );
+    }
+
+    // Deduplicate events by token_mint within the same transaction.
+    // A pool creation CPI may appear in both top-level and inner instructions.
+    events.dedup_by_key(|e| e.token_mint);
+
+    for event in events {
+        emit_event(event, event_tx, dash);
     }
 }
 
@@ -410,23 +438,30 @@ fn emit_event(
     });
 
     // Drop if scanner is backlogged (channel at capacity).
+    // The channel capacity (MIGRATION_CHANNEL_CAPACITY = 512) provides a
+    // generous buffer; drops here indicate the scanner is severely saturated.
     let _ = event_tx.try_send(event);
 }
 
-/// Scan a sequence of compiled instructions for pool creation events.
-/// Returns the first match, or None.
-fn scan_instructions<'a>(
+/// Scan a sequence of compiled instructions for pool creation events,
+/// appending all matches to `out`. Does NOT return early after the first
+/// match — a single transaction can create multiple pools.
+fn collect_events_from_instructions<'a>(
     ixs: impl Iterator<Item = &'a CompiledInstruction>,
-    dex_map: &HashMap<Pubkey, &'static str>,
+    dex_map: &dashmap::DashMap<Pubkey, &'static str>,
     account_table: &[Pubkey],
     signature: &str,
     slot: u64,
-) -> Option<MigrationEvent> {
+    out: &mut Vec<MigrationEvent>,
+) {
     for ix in ixs {
-        let program_id = account_index(account_table, ix.program_id_index as usize)?;
+        let program_id = match account_index(account_table, ix.program_id_index as usize) {
+            Some(pk) => pk,
+            None     => continue,
+        };
 
         let dex_label = match dex_map.get(&program_id) {
-            Some(label) => *label,
+            Some(label) => *label.value(),
             None        => continue,
         };
 
@@ -436,15 +471,14 @@ fn scan_instructions<'a>(
             _            => parse_generic(ix, dex_label, account_table, signature, slot),
         };
 
-        if maybe_event.is_some() {
-            return maybe_event;
+        if let Some(event) = maybe_event {
+            out.push(event);
         }
     }
-    None
 }
 
-/// Scan inner instruction groups (CPIs) for pool creation events.
-/// Returns the first match, or None.
+/// Scan inner instruction groups (CPIs) for pool creation events,
+/// appending all matches to `out`.
 ///
 /// In yellowstone-grpc-proto 12.x `InnerInstruction` exposes fields directly
 /// (program_id_index, accounts, data) without wrapping a CompiledInstruction.
@@ -454,13 +488,14 @@ fn scan_instructions<'a>(
 /// (SPL-token transfers, system transfers, etc.) that do not target any DEX.
 /// Skipping the accounts/data clone for non-matching instructions avoids
 /// unnecessary heap allocations on the hot path.
-fn scan_inner_instructions(
+fn collect_events_from_inner_instructions(
     inner_groups: &[InnerInstructions],
-    dex_map: &HashMap<Pubkey, &'static str>,
+    dex_map: &dashmap::DashMap<Pubkey, &'static str>,
     account_table: &[Pubkey],
     signature: &str,
     slot: u64,
-) -> Option<MigrationEvent> {
+    out: &mut Vec<MigrationEvent>,
+) {
     for group in inner_groups {
         for inner in &group.instructions {
             // Resolve the program ID first — no allocation needed.
@@ -470,7 +505,7 @@ fn scan_inner_instructions(
             };
 
             let dex_label = match dex_map.get(&program_id) {
-                Some(label) => *label,
+                Some(label) => *label.value(),
                 None        => continue,  // Not a DEX we monitor — skip
             };
 
@@ -489,12 +524,11 @@ fn scan_inner_instructions(
                 _            => parse_generic(&ix, dex_label, account_table, signature, slot),
             };
 
-            if maybe_event.is_some() {
-                return maybe_event;
+            if let Some(event) = maybe_event {
+                out.push(event);
             }
         }
     }
-    None
 }
 
 // ── Account table helpers ────────────────────────────────────────────
@@ -541,7 +575,7 @@ fn resolve_account(table: &[Pubkey], ix_accounts: &[u8], pos: usize) -> Option<P
     table.get(idx).copied()
 }
 
-fn pubkey_from_bytes(raw: &[u8]) -> Result<Pubkey> {
+fn pubkey_from_bytes(raw: &[u8]) -> anyhow::Result<Pubkey> {
     let arr: [u8; 32] = raw
         .try_into()
         .map_err(|_| anyhow::anyhow!("Expected 32-byte pubkey, got {}", raw.len()))?;

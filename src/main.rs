@@ -6,11 +6,21 @@
 //    Listener (gRPC) ──▶ Scanner (Jupiter quotes) ──▶ Executor (atomic tx)
 //
 //  Pipeline:
-//    1. Listener streams pool creation events from 25+ DEXes via gRPC
+//    1. Listener streams pool creation events from 35+ DEXes via gRPC
 //    2. Scanner evaluates profitability via Jupiter V6 quotes
 //    3. Executor refreshes quotes, simulates, then submits atomic tx
 //    4. Submits via Jito bundle (preferred) or standard RPC fallback
 //    5. Flash loan provider auto-selected (JupiterLend → Kamino → Marginfi → Save)
+//
+//  Performance (v2):
+//    • worker_threads raised from 4 → 8 to match 32 concurrent scanner
+//      evaluations + executor + listener + background tasks.
+//    • Migration channel capacity: 512 (was 128) — absorbs burst events.
+//    • Opportunity channel capacity: 64 (was 32) — reduces executor drops.
+//    • Quote cache: 500 ms TTL deduplicates burst requests for same token.
+//    • ALT cache: 30 s TTL avoids redundant RPC fetches per execution.
+//    • Balance cache: 2 s TTL avoids redundant balance checks.
+//    • Blockhash cache: ~350 ms TTL avoids redundant blockhash fetches.
 // ═══════════════════════════════════════════════════════════════════════
 
 mod config;
@@ -37,7 +47,17 @@ use tracing::error;
 
 use config::{AppConfig, CliArgs};
 
-#[tokio::main(flavor = "multi_thread", worker_threads = 4)]
+// Worker thread count.
+//
+// Raised from 4 → 8 to handle the increased concurrency demands of:
+//   • SCANNER_MAX_CONCURRENCY=32 (each eval spawns a task)
+//   • Executor (1 task)
+//   • Listener (1 task, with gRPC stream processing)
+//   • Background tasks (metrics reporter, dedupe cleanup)
+//
+// 8 threads gives each category headroom without over-provisioning.
+// For machines with ≥ 8 cores, consider setting this to num_cpus.
+#[tokio::main(flavor = "multi_thread", worker_threads = 8)]
 async fn main() -> Result<()> {
     let _ = dotenvy::dotenv();
 
@@ -75,8 +95,11 @@ async fn main() -> Result<()> {
         });
     }
 
-    let (migration_tx, migration_rx) = mpsc::channel(128);
-    let (opportunity_tx, opportunity_rx) = mpsc::channel(32);
+    // Use the new channel capacities from the listener and scanner modules.
+    let (migration_tx, migration_rx) =
+        mpsc::channel(listener::MIGRATION_CHANNEL_CAPACITY);
+    let (opportunity_tx, opportunity_rx) =
+        mpsc::channel(scanner::OPPORTUNITY_CHANNEL_CAPACITY);
 
     let mut listener_handle = {
         let cfg = config.clone();
