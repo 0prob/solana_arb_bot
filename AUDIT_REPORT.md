@@ -150,6 +150,8 @@ dashmap = "6"
 zeroize = "1"
 tokio-util = "0.7"
 rand = "0.10"
+ratatui = "0.29"
+crossterm = { version = "0.28", features = ["event-stream"] }
 ```
 
 ### Build Profile
@@ -217,3 +219,70 @@ Once confidence is established in the staging environment, proceed with a cautio
 *   **Alerting:** Configure robust alerting mechanisms for any deviations from expected behavior or critical errors. This includes integration with on-call systems.
 
 *   **Regular Audits:** Schedule periodic code audits and dependency checks to proactively identify and address new vulnerabilities or performance regressions.
+
+---
+
+## TUI Refactor (2026-04-04)
+
+This section documents the complete TUI audit and refactor performed as a follow-up to the initial code audit.
+
+### Executive Summary
+
+The original TUI in `src/tui.rs` was a single-file, ~116-line implementation with several critical reliability and performance issues. It used a blocking `crossterm::event::read()` call wrapped in a polling loop, which could stall the async Tokio runtime and caused measurable CPU spin even at idle. The render loop lacked proper FPS throttling, the shutdown path did not integrate with the bot's `CancellationToken`, and the UI was limited to a plain log list and three static counters.
+
+After this refactor, the TUI is a fully modular, production-grade implementation that runs a zero-spin async event loop, renders at a configurable FPS, integrates cleanly with the bot's cancellation system, and exposes a rich four-tab interface.
+
+### Critical Bugs Fixed
+
+| # | Severity | Bug | Fix |
+|---|----------|-----|-----|
+| 1 | **Critical** | Blocking `crossterm::event::read()` inside an async Tokio task. | Replaced with `crossterm::event::EventStream` consumed via `tokio::select!`. |
+| 2 | **Critical** | `event::poll()` + `event::read()` busy-loop wastes CPU at idle. | Removed; `EventStream` yields the task to the scheduler between events. |
+| 3 | **High** | No `CancellationToken` integration; pressing `q` left bot tasks running as orphans. | TUI calls `cancel.cancel()` on quit; `main.rs` also cancels on TUI task exit. |
+| 4 | **High** | Panic in TUI task left terminal in raw mode, corrupting the shell. | `panic::set_hook` installed before event loop restores terminal before printing. |
+| 5 | **Medium** | `std::sync::Mutex<TuiState>` shared between TUI and logger caused lock contention on hot log path. | Eliminated; TUI owns `App` exclusively; updates arrive via `mpsc` channel. |
+| 6 | **Medium** | Fragile substring matching in `tui_logger.rs` to detect opportunity/bundle events. | Replaced with structured `TuiEvent` enum variants populated from typed tracing fields. |
+| 7 | **Low** | Terminal resize events not handled. | `Event::Resize` matched and ignored; ratatui 0.29 handles resize automatically. |
+| 8 | **Low** | `EnableMouseCapture` unconditionally enabled even though no mouse events were processed. | Mouse capture is now opt-in via `--tui-mouse` / `TUI_MOUSE=true`. |
+
+### New Module Structure
+
+```
+src/tui/
+├── mod.rs                      # Entry point, terminal setup/teardown, event loop
+├── app.rs                      # App state (owned by TUI task, no locking)
+├── events.rs                   # TuiEvent enum (channel messages from bot)
+├── ui.rs                       # Top-level render function, tab routing
+└── widgets/
+    ├── mod.rs
+    ├── header.rs               # Title bar + tab navigation
+    ├── sparkline_chart.rs      # Profit history sparkline
+    ├── opportunities_table.rs  # Live opportunity table with P&L colour-coding
+    ├── logs_viewer.rs          # Colour-coded log viewer with filtering
+    └── help_panel.rs           # Keybindings + colour legend
+```
+
+### New Features
+
+| Feature | Details |
+|---------|---------|
+| Four-tab layout | Dashboard / Opportunities / Logs / Help |
+| Live opportunity table | Token, loan size, profit, age; colour-coded by profitability |
+| Profit sparkline | Last 60 data points in micro-SOL |
+| Colour-coded log viewer | ERROR=red, WARN=yellow, INFO=green, DEBUG=blue |
+| Log filter cycling | `f` key cycles through ERROR / WARN / opportunity presets |
+| Error banner | Displayed at top of body for critical issues |
+| Mouse scroll support | Opt-in via `--tui-mouse` |
+| Compact mode | Auto-activates below 20 terminal rows; also `--tui-compact` |
+| Configurable FPS | `--tui-fps` / `TUI_FPS` (1–60, default 10) |
+| Headless mode | `--no-tui` / `NO_TUI=true` routes logs to stdout |
+| Render time metric | Displayed in Dashboard stats grid (µs) |
+| Panic-safe restore | `panic::set_hook` restores terminal before panic output |
+
+### Dependency Change
+
+```toml
+# Cargo.toml
+-crossterm = "0.28"
++crossterm = { version = "0.28", features = ["event-stream"] }
+```

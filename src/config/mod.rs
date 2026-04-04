@@ -93,6 +93,18 @@ pub struct CliArgs {
     pub scanner_max_concurrency: usize,
     #[arg(long, env = "MAX_OPPORTUNITY_AGE_SLOTS", default_value = "20")]
     pub max_opportunity_age_slots: u64,
+    /// Disable the TUI and run in headless / log-to-stdout mode.
+    #[arg(long, env = "NO_TUI", default_value = "false")]
+    pub no_tui: bool,
+    /// TUI target frames per second (1–60).
+    #[arg(long, env = "TUI_FPS", default_value = "10")]
+    pub tui_fps: u64,
+    /// Enable mouse support in the TUI.
+    #[arg(long, env = "TUI_MOUSE", default_value = "false")]
+    pub tui_mouse: bool,
+    /// Force compact TUI layout (useful for small terminals).
+    #[arg(long, env = "TUI_COMPACT", default_value = "false")]
+    pub tui_compact: bool,
 }
 
 pub struct AppConfig {

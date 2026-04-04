@@ -23,22 +23,38 @@ async fn main() -> Result<()> {
     let _ = dotenvy::dotenv();
     let args = CliArgs::parse();
 
-    // Initialize default crypto provider for rustls
+    // Initialize default crypto provider for rustls.
     rustls::crypto::ring::default_provider()
         .install_default()
         .expect("Failed to install rustls crypto provider");
-    
-    // Initialize TUI state and channel
-    let (_tui_tx, tui_rx) = mpsc::channel(100);
-    let tui_state = Arc::new(std::sync::Mutex::new(tui::TuiState::new()));
 
-    // Custom tracing initialization with TUI layer
+    // ── Extract TUI options before args is consumed ───────────────────────
+    let no_tui    = args.no_tui;
+    let tui_fps   = args.tui_fps.clamp(1, 60);
+    let tui_mouse = args.tui_mouse;
+    let tui_compact = args.tui_compact;
+
+    // ── TUI event channel ─────────────────────────────────────────────────
+    // Capacity of 512 gives plenty of headroom for burst log traffic without
+    // blocking the hot-path scanner/executor tasks.
+    let (tui_tx, tui_rx) = mpsc::channel::<tui::events::TuiEvent>(512);
+
+    // ── Tracing setup ─────────────────────────────────────────────────────
     use tracing_subscriber::prelude::*;
-    let tui_layer = tui_logger::TuiLoggerLayer::new(_tui_tx.clone(), tui_state.clone());
-    tracing_subscriber::registry()
-        .with(tracing_subscriber::fmt::layer())
-        .with(tui_layer)
-        .init();
+    let tui_layer = tui_logger::TuiLoggerLayer::new(tui_tx);
+
+    if no_tui {
+        // Headless mode: log to stdout only.
+        tracing_subscriber::registry()
+            .with(tracing_subscriber::fmt::layer())
+            .init();
+    } else {
+        // TUI mode: suppress fmt output so it doesn't corrupt the terminal,
+        // and route everything through the TUI layer.
+        tracing_subscriber::registry()
+            .with(tui_layer)
+            .init();
+    }
 
     let config = Arc::new(AppConfig::from_cli(args)?);
     let cancel = CancellationToken::new();
@@ -84,28 +100,37 @@ async fn main() -> Result<()> {
         })
     };
 
-    let tui_handle = {
-        let state = tui_state.clone();
-        tokio::spawn(async move {
-            if let Err(e) = tui::run_tui(state, tui_rx).await {
-                eprintln!("TUI error: {}", e);
-            }
-        })
-    };
-
     info!("Bot started");
 
-    tokio::select! {
-        _ = cancel.cancelled() => {}
-        _ = tui_handle => { cancel.cancel(); }
-        r = &mut listener_handle  => { if let Err(e) = r { error!(error = %e, "Listener panicked"); } }
-        r = &mut scanner_handle   => { if let Err(e) = r { error!(error = %e, "Scanner panicked"); } }
-        r = &mut executor_handle  => { if let Err(e) = r { error!(error = %e, "Executor panicked"); } }
+    if no_tui {
+        // Headless: just wait for cancellation or task failure.
+        tokio::select! {
+            _ = cancel.cancelled() => {}
+            r = &mut listener_handle  => { if let Err(e) = r { error!(error = %e, "Listener panicked"); } }
+            r = &mut scanner_handle   => { if let Err(e) = r { error!(error = %e, "Scanner panicked"); } }
+            r = &mut executor_handle  => { if let Err(e) = r { error!(error = %e, "Executor panicked"); } }
+        }
+    } else {
+        // TUI mode: the TUI task drives shutdown when the user presses q.
+        let tui_cancel = cancel.clone();
+        let tui_handle = tokio::spawn(async move {
+            if let Err(e) = tui::run_tui(tui_rx, tui_cancel, tui_fps, tui_mouse, tui_compact).await {
+                eprintln!("TUI error: {e}");
+            }
+        });
+
+        tokio::select! {
+            _ = cancel.cancelled() => {}
+            _ = tui_handle => { cancel.cancel(); }
+            r = &mut listener_handle  => { if let Err(e) = r { error!(error = %e, "Listener panicked"); } }
+            r = &mut scanner_handle   => { if let Err(e) = r { error!(error = %e, "Scanner panicked"); } }
+            r = &mut executor_handle  => { if let Err(e) = r { error!(error = %e, "Executor panicked"); } }
+        }
     }
 
     cancel.cancel();
     let _ = tokio::join!(listener_handle, scanner_handle, executor_handle);
-    
+
     info!("Bot stopped");
     Ok(())
 }
