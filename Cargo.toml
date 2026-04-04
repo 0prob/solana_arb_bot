@@ -1,22 +1,17 @@
 [package]
 name = "sb"
-version = "0.5.0"
+version = "0.6.0"
 edition = "2021"
-description = "Zero-capital Solana flash-loan arbitrage bot"
+description = "Minimized high-performance Solana flash-loan arbitrage bot"
 authors = ["0prob"]
 license = "MIT"
 
 [dependencies]
 # ── Solana ────────────────────────────────────────────────────────────
-# Keep all directly used Solana data-model crates on the same family as
-# solana-client to avoid duplicate VersionedTransaction / solana_transaction
-# types in the graph.
 solana-client = "=3.1.11"
 solana-sdk = "=3.0.0"
 solana-transaction-status = "=3.1.11"
 solana-message = "=3.0.1"
-
-# Interface / helper crates used directly by the off-chain client.
 solana-compute-budget-interface = "3.0"
 solana-commitment-config = "3.1"
 solana-address-lookup-table-interface = "3.0.1"
@@ -37,9 +32,6 @@ serde = { version = "1", features = ["derive"] }
 serde_json = "1"
 bs58 = "0.5"
 base64 = "0.22"
-
-# Solana/Jito transaction wire format — MUST be bincode 1.x (fixed-width LE).
-# bincode 2.x uses varint encoding; Jito rejects varint-encoded bundles silently.
 bincode1 = { package = "bincode", version = "=1.3.3" }
 
 # ── CLI / Config ─────────────────────────────────────────────────────
@@ -48,25 +40,18 @@ dotenvy = "0.15"
 
 # ── Logging / Tracing ────────────────────────────────────────────────
 tracing = "0.1"
-tracing-subscriber = { version = "0.3", features = ["env-filter", "json"] }
+tracing-subscriber = { version = "0.3", features = ["env-filter"] }
 
 # ── Error handling ───────────────────────────────────────────────────
 anyhow = "1"
+thiserror = "2"
 
 # ── Misc ─────────────────────────────────────────────────────────────
 dashmap = "6"
 tokio-util = "0.7"
 rand = "0.10"
 
-# ── TUI Dashboard ────────────────────────────────────────────────────
-ratatui = "0.30"
-crossterm = "0.29"
-
 # ── Release profile — optimised for latency-critical HFT ─────────────
-# opt-level 3 + thin-LTO + single codegen unit gives the best
-# inlining and dead-code elimination without the full-LTO link cost.
-# panic=abort removes the unwinding machinery (~10 % binary size).
-# strip=true removes debug symbols from the final binary.
 [profile.release]
 opt-level = 3
 lto = "thin"
@@ -74,8 +59,5 @@ strip = true
 codegen-units = 1
 panic = "abort"
 
-# ── Dev profile — faster incremental builds during development ────────
-# opt-level 1 gives enough optimisation to make async/await readable in
-# backtraces while keeping compile times short.
 [profile.dev]
 opt-level = 1
