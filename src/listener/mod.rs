@@ -98,27 +98,24 @@ async fn run_inner(
 
     let mut accounts = std::collections::HashMap::new();
     let dex_map = crate::dex_registry::detectable_dex_map();
+    
+    // Consolidate all DEX and lending programs into a single filter to stay under the 10-filter limit.
+    let mut all_owners = Vec::new();
     for entry in dex_map.iter() {
-        let program_id = entry.key();
-        accounts.insert(
-            format!("dex_{}", program_id),
-            SubscribeRequestFilterAccounts {
-                account: vec![],
-                owner: vec![program_id.to_string()],
-                filters: vec![],
-                nonempty_txn_signature: None,
-            },
-        );
+        all_owners.push(entry.key().to_string());
     }
 
-    // Subscribe to lending protocols for liquidation detection.
     let lending_programs = crate::config::programs::lending_programs();
     for program_id in &lending_programs {
+        all_owners.push(program_id.to_string());
+    }
+
+    if !all_owners.is_empty() {
         accounts.insert(
-            format!("lending_{}", program_id),
+            "monitored_programs".to_string(),
             SubscribeRequestFilterAccounts {
                 account: vec![],
-                owner: vec![program_id.to_string()],
+                owner: all_owners,
                 filters: vec![],
                 nonempty_txn_signature: None,
             },
