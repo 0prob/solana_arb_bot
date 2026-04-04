@@ -110,6 +110,16 @@ async fn run_inner(
         all_owners.push(program_id.to_string());
     }
 
+    // Tatum has a strict limit of 10 Pubkeys per filter.
+    if all_owners.len() > 10 {
+        warn!(
+            total = all_owners.len(),
+            limit = 10,
+            "Too many monitored programs; capping to the first 10 to stay within gRPC limits."
+        );
+        all_owners.truncate(10);
+    }
+
     if !all_owners.is_empty() {
         accounts.insert(
             "monitored_programs".to_string(),
