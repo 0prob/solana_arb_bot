@@ -68,7 +68,7 @@ pub async fn run(
 
     // Subscribe to lending protocols for liquidations
     let lending_programs = crate::config::programs::lending_programs();
-    for program_id in lending_programs {
+    for program_id in &lending_programs {
         accounts.insert(
             format!("lending_{}", program_id),
             SubscribeRequestFilterAccounts {
@@ -87,7 +87,13 @@ pub async fn run(
     };
 
     let (_, mut stream) = client.subscribe_with_request(Some(request)).await?;
-    info!("Listener connected to gRPC with transaction, account, and lending filters");
+    info!(
+        provider = "tatum",
+        endpoint = %config.grpc_endpoint,
+        dex_count = dex_map.len(),
+        lending_count = lending_programs.len(),
+        "gRPC subscription active — listening for opportunities"
+    );
 
     loop {
         tokio::select! {
@@ -96,9 +102,13 @@ pub async fn run(
                 let update = match update {
                     Some(Ok(u)) => u,
                     Some(Err(e)) => {
-                        warn!(error = %e, "gRPC stream error, attempting to reconnect...");
-                        // Reconnection logic
-                        tokio::time::sleep(std::time::Duration::from_secs(1)).await;
+                        warn!(
+                            error = %e,
+                            delay_secs = 5,
+                            "gRPC stream message error — reconnecting with backoff"
+                        );
+                        // Reconnection logic with backoff
+                        tokio::time::sleep(std::time::Duration::from_secs(5)).await;
                         match GeyserGrpcClient::build_from_shared(config.grpc_endpoint.clone())?
                             .x_token(Some(&config.grpc_x_token))?
                             .tls_config(tonic::transport::ClientTlsConfig::new().with_native_roots())?
@@ -131,8 +141,11 @@ pub async fn run(
                         }
                     }
                     None => {
-                        warn!("gRPC stream ended, attempting to reconnect...");
-                        tokio::time::sleep(std::time::Duration::from_secs(1)).await;
+                        warn!(
+                            delay_secs = 5,
+                            "gRPC stream ended unexpectedly — reconnecting"
+                        );
+                        tokio::time::sleep(std::time::Duration::from_secs(5)).await;
                         // Similar reconnection logic for stream end
                         if let Ok(new_client) = GeyserGrpcClient::build_from_shared(config.grpc_endpoint.clone())?
                             .x_token(Some(&config.grpc_x_token))?

@@ -77,6 +77,12 @@ async fn evaluate_triangular_opportunity(
         
         let profit = crate::jupiter::estimate_profit(amount, &sell_quote, 0, config.estimated_tx_cost())?;
         if profit >= config.min_profit_lamports as i64 {
+            info!(
+                token = %token_mint,
+                loan_sol = (amount as f64 / 1_000_000_000.0),
+                profit_sol = (profit as f64 / 1_000_000_000.0),
+                "Arbitrage opportunity found"
+            );
             let opp = ArbOpportunity {
                 loan_lamports: amount,
                 buy_quote,
@@ -85,6 +91,13 @@ async fn evaluate_triangular_opportunity(
             };
             let _ = tx.try_send(opp);
             break;
+        } else {
+            debug!(
+                token = %token_mint,
+                loan_sol = (amount as f64 / 1_000_000_000.0),
+                profit_sol = (profit as f64 / 1_000_000_000.0),
+                "Opportunity not profitable enough"
+            );
         }
     }
     Ok(())

@@ -113,7 +113,12 @@ async fn execute_opportunity(
     }
 
     let bundle_id = jito.send_bundle(&[tx]).await?;
-    info!(bundle_id, "Bundle submitted");
+    info!(
+        bundle_id,
+        profit_sol = (profit as f64 / 1_000_000_000.0),
+        tip_sol = (tip as f64 / 1_000_000_000.0),
+        "Bundle submitted to Jito"
+    );
 
     Ok(())
 }

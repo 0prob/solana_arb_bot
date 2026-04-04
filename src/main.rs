@@ -7,6 +7,7 @@ mod jupiter;
 mod listener;
 mod safety;
 mod scanner;
+mod tui;
 
 use anyhow::Result;
 use clap::Parser;
@@ -21,6 +22,11 @@ async fn main() -> Result<()> {
     let _ = dotenvy::dotenv();
     let args = CliArgs::parse();
     
+    // Initialize TUI state and channel
+    let (_tui_tx, tui_rx) = mpsc::channel(100);
+    let tui_state = Arc::new(std::sync::Mutex::new(tui::TuiState::new()));
+
+    // Standard tracing initialization
     tracing_subscriber::fmt::init();
 
     let config = Arc::new(AppConfig::from_cli(args)?);
@@ -67,10 +73,20 @@ async fn main() -> Result<()> {
         })
     };
 
+    let tui_handle = {
+        let state = tui_state.clone();
+        tokio::spawn(async move {
+            if let Err(e) = tui::run_tui(state, tui_rx).await {
+                eprintln!("TUI error: {}", e);
+            }
+        })
+    };
+
     info!("Bot started");
 
     tokio::select! {
         _ = cancel.cancelled() => {}
+        _ = tui_handle => { cancel.cancel(); }
         r = &mut listener_handle  => { if let Err(e) = r { error!(error = %e, "Listener panicked"); } }
         r = &mut scanner_handle   => { if let Err(e) = r { error!(error = %e, "Scanner panicked"); } }
         r = &mut executor_handle  => { if let Err(e) = r { error!(error = %e, "Executor panicked"); } }
