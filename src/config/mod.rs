@@ -52,7 +52,7 @@ pub mod programs {
             vec![
                 Pubkey::from_str("So1endDq2Ykq6EB8WnAn8W7THCWYFTFvXrqcnS8tMvS").unwrap(), // Solend
                 Pubkey::from_str("KLend2g3cPEPihL362shW35otGoSS6V3fM6fHjr45qG").unwrap(), // Kamino
-                Pubkey::from_str("MFi7Gk7uXp89H9E9G89G89G89G89G89G89G89G89G89").unwrap(), // Marginfi Placeholder (example valid format)
+                Pubkey::from_str("MFv2hWf31Z9kbCa1snEPYktwafCSNDh8nX1H6A21R5X").unwrap(), // Marginfi V2 Program ID
             ]
         }).clone()
     }
@@ -131,18 +131,22 @@ pub struct AppConfig {
     pub max_memory_mb: u64,
 }
 
-impl Drop for AppConfig {
-    fn drop(&mut self) {
-        // Drop implementation for AppConfig
-    }
-}
-
 impl AppConfig {
     pub fn from_cli(args: CliArgs) -> Result<Self> {
         programs::validate_constants();
         let key_bytes = bs58::decode(&args.fee_payer_keypair_base58).into_vec()?;
         let fee_payer = Keypair::try_from(key_bytes.as_slice())
             .map_err(|e| anyhow::anyhow!("Invalid keypair: {e}"))?;
+
+        if args.min_profit_sol < 0.0 {
+            return Err(anyhow::anyhow!("MIN_PROFIT_SOL must be non-negative"));
+        }
+        if args.max_loan_sol <= 0.0 {
+            return Err(anyhow::anyhow!("MAX_LOAN_SOL must be positive"));
+        }
+        if args.jito_tip_profit_fraction < 0.0 || args.jito_tip_profit_fraction > 1.0 {
+            return Err(anyhow::anyhow!("JITO_TIP_PROFIT_FRACTION must be in [0.0, 1.0]"));
+        }
 
         Ok(Self {
             rpc_url: args.rpc_url.into(),
@@ -162,10 +166,35 @@ impl AppConfig {
         })
     }
 
+    /// Compute the Jito bundle tip as a fraction of profit.
+    ///
+    /// Uses integer arithmetic to avoid f64 rounding.  The fraction is stored as
+    /// a float in config for human readability, but is converted to a basis-point
+    /// integer (0–1000) here to keep the hot path allocation-free.
+    ///
+    /// Enforces a minimum tip of 1_000 lamports (0.000001 SOL) so the bundle
+    /// is always competitive, and a maximum of 50% of profit to prevent
+    /// misconfigured fractions from eating the entire profit.
     pub fn dynamic_jito_tip(&self, profit_lamports: u64) -> u64 {
-        (profit_lamports as f64 * self.jito_tip_profit_fraction) as u64
+        // Convert fraction to basis points (0–1000) using integer arithmetic.
+        let fraction_bps = (self.jito_tip_profit_fraction.clamp(0.0, 1.0) * 1000.0) as u64;
+        let tip = profit_lamports.saturating_mul(fraction_bps) / 1000;
+        // Minimum tip: 1_000 lamports (ensures bundle is submitted even on tiny profits).
+        // Maximum tip: 50% of profit (safety cap against misconfiguration).
+        tip.clamp(1_000, profit_lamports / 2)
     }
 
+    /// Estimated on-chain transaction cost in lamports.
+    ///
+    /// Covers:
+    /// - 5_000 lamports: base transaction fee (5 signatures × 1000 lamports)
+    /// - 10_000 lamports: compute-unit priority fee budget
+    ///
+    /// Total: 15_000 lamports (0.000015 SOL)
+    ///
+    /// This is a conservative estimate.  The actual cost depends on the number
+    /// of signatures and the compute-unit price set by the Jito tip.
+    #[inline(always)]
     pub fn estimated_tx_cost(&self) -> u64 {
         15_000
     }

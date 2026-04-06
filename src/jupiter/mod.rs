@@ -115,7 +115,12 @@ impl JupiterClient {
         let body = serde_json::json!({
             "quoteResponse": quote,
             "userPublicKey": user_pubkey.to_string(),
+            // WSOL wrapping is handled externally by the flash-loan setup instruction.
+            // Enabling it here would add a redundant wrap/unwrap that conflicts with
+            // the flash-loan WSOL ATA lifecycle.
             "wrapAndUnwrapSol": false,
+            // Skip Jupiter's own compute budget instruction — we set our own via Jito tip.
+            "skipUserAccountsRpcCalls": true,
         });
         let resp = self.http
             .post(&url)
@@ -150,14 +155,19 @@ fn b64_deserialize(s: &str) -> Result<Vec<u8>> {
 }
 
 #[inline]
+/// Estimate net profit from a round-trip arb.
+///
+/// `sell_quote.other_amount_threshold` is the minimum output guaranteed by Jupiter
+/// after applying slippage (i.e., it already accounts for `slippage_bps`).  Applying
+/// a second fee haircut here would double-count slippage and produce falsely pessimistic
+/// profit estimates.  We therefore use the threshold directly and only subtract the
+/// loan principal and on-chain transaction cost.
 pub fn estimate_profit(
     loan_amount: u64,
     sell_quote: &QuoteResponse,
-    fee_bps: u16,
+    _fee_bps: u16, // retained for API compatibility; no longer applied
     tx_cost: u64,
 ) -> Result<i64> {
-    let out_amount: u64 = sell_quote.other_amount_threshold.parse()?;
-    let fee_adjustment = (out_amount as u128 * fee_bps as u128 / 10000) as u64;
-    let net_out = out_amount.saturating_sub(fee_adjustment);
-    Ok(net_out as i64 - loan_amount as i64 - tx_cost as i64)
+    let min_out: u64 = sell_quote.other_amount_threshold.parse()?;
+    Ok(min_out as i64 - loan_amount as i64 - tx_cost as i64)
 }

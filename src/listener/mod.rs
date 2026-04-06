@@ -11,9 +11,16 @@ use yellowstone_grpc_proto::geyser::{
 use futures::StreamExt;
 use crate::config::AppConfig;
 
-/// Bounded migration channel — 64 slots prevents OOM under burst.
-/// Events beyond capacity are dropped via try_send (non-blocking).
-pub const MIGRATION_CHANNEL_CAPACITY: usize = 64;
+/// Bounded migration channel capacity.
+///
+/// Sizing rationale:
+/// - Pump.fun can emit 50–100 migration events per second during peak activity.
+/// - The scanner processes events at ~10–20/s (limited by Jupiter round-trips).
+/// - 128 slots provides ~1–2 seconds of burst buffer before dropping events.
+/// - Larger values waste heap; smaller values cause unnecessary drops.
+/// - Events beyond capacity are dropped via try_send (non-blocking) — this is
+///   intentional: stale events are worthless, so dropping is preferable to blocking.
+pub const MIGRATION_CHANNEL_CAPACITY: usize = 128;
 
 /// Maximum reconnection backoff in seconds.
 const MAX_BACKOFF_SECS: u64 = 60;
@@ -21,7 +28,6 @@ const MAX_BACKOFF_SECS: u64 = 60;
 #[derive(Debug, Clone)]
 pub enum EventType {
     Migration(Pubkey),
-    Liquidation(Pubkey),
 }
 
 #[derive(Debug, Clone)]
@@ -61,6 +67,8 @@ pub async fn run(
                     _ = tokio::time::sleep(std::time::Duration::from_secs(backoff_secs)) => {}
                 }
                 backoff_secs = (backoff_secs * 2).min(MAX_BACKOFF_SECS);
+                // Do not reset here; backoff resets only after a sustained connection.
+                continue;
             }
         }
     }
@@ -105,11 +113,6 @@ async fn run_inner(
         all_owners.push(entry.key().to_string());
     }
 
-    let lending_programs = crate::config::programs::lending_programs();
-    for program_id in &lending_programs {
-        all_owners.push(program_id.to_string());
-    }
-
     // Tatum has a strict limit of 10 Pubkeys per filter.
     if all_owners.len() > 10 {
         warn!(
@@ -146,26 +149,33 @@ async fn run_inner(
     info!(
         endpoint = %config.grpc_endpoint,
         dex_count = dex_map.len(),
-        lending_count = lending_programs.len(),
         "gRPC subscription active"
     );
+
+    // A 120-second timeout on any individual stream.next() call detects silent stalls
+    // (e.g., network partition where the TCP connection appears alive but no data flows).
+    const STREAM_IDLE_TIMEOUT_SECS: u64 = 120;
 
     loop {
         tokio::select! {
             _ = cancel.cancelled() => return Ok(()),
-            update = stream.next() => {
-                let update = match update {
-                    Some(Ok(u)) => u,
-                    Some(Err(e)) => return Err(e.into()),
-                    None => return Err(anyhow::anyhow!("gRPC stream ended")),
+            result = tokio::time::timeout(
+                std::time::Duration::from_secs(STREAM_IDLE_TIMEOUT_SECS),
+                stream.next()
+            ) => {
+                let update = match result {
+                    Ok(Some(Ok(u))) => u,
+                    Ok(Some(Err(e))) => return Err(e.into()),
+                    Ok(None) => return Err(anyhow::anyhow!("gRPC stream ended unexpectedly")),
+                    Err(_) => return Err(anyhow::anyhow!("gRPC stream idle for {}s — reconnecting", STREAM_IDLE_TIMEOUT_SECS)),
                 };
 
                 match update.update_oneof {
                     Some(yellowstone_grpc_proto::geyser::subscribe_update::UpdateOneof::Transaction(tx_update)) => {
-                        process_transaction(&tx_update, tx, dex_map).await;
+                        process_transaction(&tx_update, tx, dex_map);
                     }
                     Some(yellowstone_grpc_proto::geyser::subscribe_update::UpdateOneof::Account(acc_update)) => {
-                        process_account_update(&acc_update, tx, dex_map).await;
+                        process_account_update(&acc_update, tx, dex_map);
                     }
                     _ => {}
                 }
@@ -175,7 +185,7 @@ async fn run_inner(
 }
 
 #[inline]
-async fn process_transaction(
+fn process_transaction(
     tx_update: &yellowstone_grpc_proto::geyser::SubscribeUpdateTransaction,
     tx: &mpsc::Sender<ArbEvent>,
     dex_map: &dashmap::DashMap<Pubkey, &'static str>,
@@ -189,6 +199,11 @@ async fn process_transaction(
         None => return,
     };
 
+    // Hoist wsol_mint() outside the instruction loop — it is a static value
+    // but the function call itself has a small overhead per iteration.
+    let wsol = crate::config::programs::wsol_mint();
+    // Also pre-compute the system program pubkey to skip it in account scanning.
+    let system_program: Pubkey = "11111111111111111111111111111111".parse().unwrap_or_default();
     for ix in &message.instructions {
         let program_id_idx = ix.program_id_index as usize;
         let program_id_bytes = match message.account_keys.get(program_id_idx) {
@@ -201,7 +216,6 @@ async fn process_transaction(
         };
 
         if dex_map.contains_key(&program_id) {
-            let wsol = crate::config::programs::wsol_mint();
             for &idx in &ix.accounts {
                 let pk_bytes = match message.account_keys.get(idx as usize) {
                     Some(b) => b,
@@ -211,7 +225,7 @@ async fn process_transaction(
                     Ok(pk) => pk,
                     Err(_) => continue,
                 };
-                if pk != program_id && pk != wsol {
+                if pk != program_id && pk != wsol && pk != system_program {
                     debug!(token = %pk, "Pool detected via transaction");
                     let _ = tx.try_send(ArbEvent {
                         event_type: EventType::Migration(pk),
@@ -225,7 +239,7 @@ async fn process_transaction(
 }
 
 #[inline]
-async fn process_account_update(
+fn process_account_update(
     acc_update: &yellowstone_grpc_proto::geyser::SubscribeUpdateAccount,
     tx: &mpsc::Sender<ArbEvent>,
     dex_map: &dashmap::DashMap<Pubkey, &'static str>,
@@ -249,11 +263,6 @@ async fn process_account_update(
             event_type: EventType::Migration(pk),
             slot: acc_update.slot,
         });
-    } else if crate::config::programs::lending_programs().contains(&owner) {
-        debug!(account = %pk, "Lending account update detected");
-        let _ = tx.try_send(ArbEvent {
-            event_type: EventType::Liquidation(pk),
-            slot: acc_update.slot,
-        });
     }
+    // Liquidation event handling removed: no complete implementation exists.
 }

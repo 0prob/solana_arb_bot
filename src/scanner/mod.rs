@@ -28,10 +28,16 @@ pub async fn run(
     let max_concurrency = config.scanner_max_concurrency.min(MOBILE_MAX_CONCURRENCY);
     let semaphore = Arc::new(Semaphore::new(max_concurrency));
 
-    // Simple dedup: track last-seen pubkey to skip duplicate events within a slot.
+    // Dedup: track last-seen (pubkey, slot) pairs to skip duplicate events within a slot window.
     // Uses a fixed-size ring buffer via a small VecDeque cap.
+    // O(n) scan is acceptable here because n <= 32 and this is the event-receive path,
+    // not the inner quote path.  A DashSet would add Arc overhead for no real gain at n=32.
     let mut recent_keys: std::collections::VecDeque<(solana_sdk::pubkey::Pubkey, u64)> =
         std::collections::VecDeque::with_capacity(32);
+
+    // Maximum age in slots for an event to be considered fresh.
+    // Events older than this are dropped before any Jupiter round-trips.
+    let max_event_age_slots = config.max_opportunity_age_slots;
 
     info!(
         max_concurrency,
@@ -47,10 +53,21 @@ pub async fn run(
             },
         };
 
+        let EventType::Migration(event_key) = event.event_type;
+
+        // ── Slot-staleness pre-check ──────────────────────────────────────────
+        // We don’t have the current chain slot here (no RPC call), so we use the
+        // event’s own slot as a lower bound.  The executor does the authoritative
+        // check.  We only drop events that are already stale relative to the most
+        // recently seen slot in our dedup buffer.
+        if let Some(&(_, newest_slot)) = recent_keys.back() {
+            if newest_slot > event.slot + max_event_age_slots {
+                debug!(token = %event_key, slot = event.slot, newest_slot, "Dropping stale event");
+                continue;
+            }
+        }
+
         // ── Deduplication: skip if same key seen in the last 32 events ───
-        let event_key = match &event.event_type {
-            EventType::Migration(pk) | EventType::Liquidation(pk) => *pk,
-        };
         let is_dup = recent_keys.iter().any(|(k, slot)| {
             *k == event_key && event.slot.saturating_sub(*slot) < 5
         });
@@ -77,19 +94,11 @@ pub async fn run(
         let jup = jupiter.clone();
         let tx = opportunity_tx.clone();
 
+        let token_mint = event_key;
         tokio::spawn(async move {
             let _permit = permit;
-            match event.event_type {
-                EventType::Migration(token_mint) => {
-                    if let Err(e) = evaluate_triangular_opportunity(cfg, jup, token_mint, event.slot, tx).await {
-                        debug!(error = %e, "Triangular evaluation failed");
-                    }
-                }
-                EventType::Liquidation(obligation_account) => {
-                    if let Err(e) = evaluate_liquidation_opportunity(cfg, jup, obligation_account, event.slot, tx).await {
-                        debug!(error = %e, "Liquidation evaluation failed");
-                    }
-                }
+            if let Err(e) = evaluate_triangular_opportunity(cfg, jup, token_mint, event.slot, tx).await {
+                debug!(error = %e, "Triangular evaluation failed");
             }
         });
     }
@@ -172,17 +181,5 @@ async fn evaluate_triangular_opportunity(
             break;
         }
     }
-    Ok(())
-}
-
-async fn evaluate_liquidation_opportunity(
-    _config: Arc<AppConfig>,
-    _jupiter: JupiterClient,
-    _obligation_account: solana_sdk::pubkey::Pubkey,
-    _slot: u64,
-    _tx: mpsc::Sender<ArbOpportunity>,
-) -> Result<()> {
-    // Stub: liquidation requires protocol-specific account parsing.
-    debug!("Liquidation check for obligation: {}", _obligation_account);
     Ok(())
 }

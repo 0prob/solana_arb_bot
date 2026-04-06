@@ -154,12 +154,25 @@ async fn main() -> Result<()> {
     info!("Bot started (mobile-optimized build)");
 
     if no_tui {
-        // Headless: just wait for cancellation or task failure.
+        // Headless: wait for cancellation or task failure.
+        // If any critical task panics, cancel all others for a clean shutdown.
         tokio::select! {
             _ = cancel.cancelled() => {}
-            r = &mut listener_handle  => { if let Err(e) = r { error!(error = %e, "Listener panicked"); } }
-            r = &mut scanner_handle   => { if let Err(e) = r { error!(error = %e, "Scanner panicked"); } }
-            r = &mut executor_handle  => { if let Err(e) = r { error!(error = %e, "Executor panicked"); } }
+            r = &mut listener_handle  => {
+                if let Err(e) = r { error!(error = %e, "Listener panicked"); }
+                else { error!("Listener exited unexpectedly"); }
+                cancel.cancel();
+            }
+            r = &mut scanner_handle   => {
+                if let Err(e) = r { error!(error = %e, "Scanner panicked"); }
+                else { error!("Scanner exited unexpectedly"); }
+                cancel.cancel();
+            }
+            r = &mut executor_handle  => {
+                if let Err(e) = r { error!(error = %e, "Executor panicked"); }
+                else { error!("Executor exited unexpectedly"); }
+                cancel.cancel();
+            }
         }
     } else {
         #[cfg(feature = "tui")]
@@ -176,9 +189,21 @@ async fn main() -> Result<()> {
             tokio::select! {
                 _ = cancel.cancelled() => {}
                 _ = tui_handle => { cancel.cancel(); }
-                r = &mut listener_handle  => { if let Err(e) = r { error!(error = %e, "Listener panicked"); } }
-                r = &mut scanner_handle   => { if let Err(e) = r { error!(error = %e, "Scanner panicked"); } }
-                r = &mut executor_handle  => { if let Err(e) = r { error!(error = %e, "Executor panicked"); } }
+                r = &mut listener_handle  => {
+                    if let Err(e) = r { error!(error = %e, "Listener panicked"); }
+                    else { error!("Listener exited unexpectedly"); }
+                    cancel.cancel();
+                }
+                r = &mut scanner_handle   => {
+                    if let Err(e) = r { error!(error = %e, "Scanner panicked"); }
+                    else { error!("Scanner exited unexpectedly"); }
+                    cancel.cancel();
+                }
+                r = &mut executor_handle  => {
+                    if let Err(e) = r { error!(error = %e, "Executor panicked"); }
+                    else { error!("Executor exited unexpectedly"); }
+                    cancel.cancel();
+                }
             }
         }
         #[cfg(not(feature = "tui"))]
@@ -186,9 +211,21 @@ async fn main() -> Result<()> {
             // TUI feature disabled at compile time — fall back to headless.
             tokio::select! {
                 _ = cancel.cancelled() => {}
-                r = &mut listener_handle  => { if let Err(e) = r { error!(error = %e, "Listener panicked"); } }
-                r = &mut scanner_handle   => { if let Err(e) = r { error!(error = %e, "Scanner panicked"); } }
-                r = &mut executor_handle  => { if let Err(e) = r { error!(error = %e, "Executor panicked"); } }
+                r = &mut listener_handle  => {
+                    if let Err(e) = r { error!(error = %e, "Listener panicked"); }
+                    else { error!("Listener exited unexpectedly"); }
+                    cancel.cancel();
+                }
+                r = &mut scanner_handle   => {
+                    if let Err(e) = r { error!(error = %e, "Scanner panicked"); }
+                    else { error!("Scanner exited unexpectedly"); }
+                    cancel.cancel();
+                }
+                r = &mut executor_handle  => {
+                    if let Err(e) = r { error!(error = %e, "Executor panicked"); }
+                    else { error!("Executor exited unexpectedly"); }
+                    cancel.cancel();
+                }
             }
         }
     }

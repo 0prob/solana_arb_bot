@@ -45,8 +45,13 @@ fn rss_mb() -> Option<u64> {
 /// Background task: monitor memory usage and cancel on OOM risk.
 pub async fn run(config: Arc<AppConfig>, cancel: CancellationToken) {
     let max_mb = config.max_memory_mb;
-    let warn_threshold = (max_mb as f64 * 0.70) as u64;
-    let critical_threshold = (max_mb as f64 * 0.90) as u64;
+    if max_mb == 0 {
+        // No limit configured; skip monitoring.
+        return;
+    }
+    // Use integer arithmetic to avoid f64 rounding imprecision.
+    let warn_threshold = max_mb * 70 / 100;
+    let critical_threshold = max_mb * 90 / 100;
 
     info!(
         max_mb,
@@ -94,7 +99,7 @@ pub async fn run(config: Arc<AppConfig>, cancel: CancellationToken) {
                             static TICK: std::sync::atomic::AtomicU64 =
                                 std::sync::atomic::AtomicU64::new(0);
                             let t = TICK.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
-                            if t % 6 == 0 {
+                            if t.is_multiple_of(6) {
                                 info!(
                                     rss_mb = rss,
                                     limit_mb = max_mb,
